@@ -1,12 +1,12 @@
 'use strict';
 
-// Moon Knowledge Engine v0.5.1
+// Moon Knowledge Engine v0.5.2
 // Standalone Yandex Cloud Function. Node.js 22+, zero npm dependencies.
 // Stores MediaWiki pages and a compact search index in the existing Yandex Object Storage bucket.
 
 const crypto = require('crypto');
 
-const KB_VERSION = '0.5.1';
+const KB_VERSION = '0.5.2';
 const TOKEN = process.env.KB_TOKEN || '';
 const BUCKET = process.env.KB_BUCKET || process.env.BUCKET || 'moon-assistant';
 const S3_ID = process.env.ACCESS_KEY_ID || '';
@@ -23,7 +23,7 @@ const MAX_PAGE_TEXT = Math.min(50000, Math.max(5000, Number(process.env.KB_MAX_P
 const MAX_ENRICH_PAGES = Math.min(8, Math.max(1, Number(process.env.KB_MAX_ENRICH_PAGES || 5)));
 const MAX_PARSE_FALLBACK_PAGES = 2;
 
-const UA = 'MoonKnowledgeEngine/0.5.1 (universal multilingual game knowledge; contact: configure KB_CONTACT)';
+const UA = 'MoonKnowledgeEngine/0.5.2 (universal multilingual game knowledge; contact: configure KB_CONTACT)';
 const TRANSLATION_TIMEOUT_MS = Math.min(9000, Math.max(2000, Number(process.env.KB_TRANSLATION_TIMEOUT_MS || 5500)));
 const DISCOVERY_TIMEOUT_MS = Number(process.env.KB_DISCOVERY_TIMEOUT_MS || 9000);
 const DISCOVERY_MAX_CANDIDATES = 6;
@@ -52,6 +52,70 @@ function safeEqual(a, b) {
 function normalize(s) {
   return String(s || '').toLowerCase().replace(/ё/g, 'е').normalize('NFKC')
     .replace(/[^\p{L}\p{N}]+/gu, ' ').trim().replace(/\s+/g, ' ');
+}
+const SEARCH_STOP_WORDS = new Set((
+  'а без более бы был была были было быть в вам вас весь во вот все всего всех вы где да даже для до его ее если есть еще же за здесь и из или им их к как ко когда кто ли либо мне может мы на над надо наш не него нее нет ни них но ну о об один она они оно от потому по под при про с со так также такой там те тем то того тоже той только том ты у уже чем что чтобы эта эти это я этот эту ' +
+  'a an and are as at be been being but by can could did do does doing for from had has have he her hers him his how i if in into is it its may me might mine my no nor not of off on once only or other our ours she should so some such than that the their theirs them then there these they this those through to too under until up very was we were what when where which who whom why will with would you your yours'
+).split(/\s+/));
+
+function stemSearchToken(raw) {
+  let token=normalize(raw);
+  if(token.length<5)return token;
+
+  if(/[а-я]/i.test(token)){
+    const suffixes=['иями','ями','ами','иях','ией','ию','ии','ия','ого','ему','ому','ыми','ими','его','ую','юю','ая','яя','ое','ее','ые','ие','ым','им','ом','ем','ов','ев','ей','ья','ах','ях','ам','ям','ы','и','а','я','у','ю','е','о'];
+    for(const suffix of suffixes){
+      if(token.endsWith(suffix)&&token.length-suffix.length>=3){
+        token=token.slice(0,-suffix.length);
+        break;
+      }
+    }
+  }else{
+    const suffixes=['ingly','edly','ments','ment','ation','ations','ing','ers','ies','ied','ed','es','s'];
+    for(const suffix of suffixes){
+      if(token.endsWith(suffix)&&token.length-suffix.length>=3){
+        token=token.slice(0,-suffix.length);
+        if(suffix==='ies'||suffix==='ied')token+='y';
+        break;
+      }
+    }
+  }
+
+  return token;
+}
+
+function searchTokens(value){
+  const raw=normalize(value).split(' ').filter(Boolean);
+  const out=[];
+  const seen=new Set();
+
+  for(const token of raw){
+    if(token.length<2||SEARCH_STOP_WORDS.has(token))continue;
+
+    for(const candidate of [token,stemSearchToken(token)]){
+      if(candidate.length<2||seen.has(candidate))continue;
+      seen.add(candidate);
+      out.push(candidate);
+    }
+  }
+
+  return out;
+}
+
+function isRealNameIntent(query){
+  const q=normalize(query);
+
+  return /(?:\breal name\b|\bbirth name\b|\bfull name\b|\bgiven name\b|\blegal name\b|\bborn as\b|настоящ[\p{L}]*\s+им[\p{L}]*|полны[\p{L}]*\s+им[\p{L}]*|им[\p{L}]*\s+при\s+рожд[\p{L}]*|как\s+зовут|как\s+звали|реальн[\p{L}]*\s+им[\p{L}]*)/u.test(q);
+}
+
+function queryHintTerms(query){
+  if(!isRealNameIntent(query))return [];
+
+  return [
+    'epitaph','эпитафия','эпитафии','inscription','надпись',
+    'birth name','born as','full name','given name','real name',
+    'memorial','tombstone','grave','called','known as'
+  ];
 }
 
 function slug(s) {
@@ -952,21 +1016,23 @@ function makePageRecord(p, manifest) {
   };
 }
 
-function makeIndexItem(rec) {
-  const text = rec.title + ' ' +
-    rec.categories.join(' ') + ' ' +
-    rec.extract.slice(0, 12000);
+function makeIndexItem(rec){
+  const extract=String(rec.extract||'');
+  const head=extract.slice(0,10000);
+  const tail=extract.slice(-18000);
+  const common=rec.title+' '+(rec.categories||[]).join(' ')+' ';
+  const headTokens=searchTokens(common+head).slice(0,500);
+  const tailTokens=searchTokens(tail).slice(0,700);
 
   return {
-    pageId: rec.pageId,
-    title: rec.title,
-    url: rec.url,
-    revisionId: rec.revisionId,
-    categories: rec.categories,
-    lead: rec.extract.slice(0, 700),
-    tokens: Array.from(new Set(normalize(text).split(' ')))
-      .filter(x => x.length > 1)
-      .slice(0, 350)
+    pageId:rec.pageId,
+    title:rec.title,
+    url:rec.url,
+    revisionId:rec.revisionId,
+    categories:rec.categories,
+    lead:extract.slice(0,900),
+    tail:extract.slice(-900),
+    tokens:Array.from(new Set(headTokens.concat(tailTokens))).slice(0,1100)
   };
 }
 
@@ -1572,34 +1638,72 @@ async function syncGame(body) {
   };
 }
 
-function scoreItem(item, terms) {
-  const title = normalize(item.title);
-  const lead = normalize(item.lead);
-  const tokens = new Set(item.tokens || []);
+function scoreItem(item,terms){
+  const title=new Set(searchTokens(item.title)),lead=new Set(searchTokens(item.lead));
+  const tail=new Set(searchTokens(item.tail||'')),tokens=new Set(item.tokens||[]);
+  let score=0,matched=0;
 
-  let score = 0;
-
-  for (const t of terms) {
-    if (title === t) {
-      score += 20;
-    } else if (title.includes(t)) {
-      score += 10;
+  for(const t of terms){
+    let hit=false;
+    if(title.has(t)){
+      score+=16;
+      hit=true;
+    }else if(tokens.has(t)){
+      score+=4;
+      hit=true;
     }
-
-    if (tokens.has(t)) score += 4;
-    if (lead.includes(t)) score += 2;
+    if(lead.has(t))score+=2;
+    if(tail.has(t))score+=3;
+    if(hit)matched++;
   }
 
-  if (terms.length &&
-      terms.every(t =>
-        title.includes(t) ||
-        tokens.has(t) ||
-        lead.includes(t)
-      )) {
-    score += 5;
+  if(terms.length&&matched>=Math.min(2,terms.length))score+=4;
+  return score;
+}
+
+function scoreEvidenceChunk(chunk,terms,query){
+  const text=normalize(chunk);
+  const tokens=new Set(searchTokens(chunk));
+  let score=0,matched=0;
+
+  for(const term of terms){
+    if(tokens.has(term)){
+      score+=2;
+      matched++;
+    }
+  }
+
+  if(terms.length&&matched>=Math.min(2,terms.length))score+=3;
+
+  if(isRealNameIntent(query)&&(
+    /\b(epitaph|inscription|birth name|born as|full name|given name|real name|known as|called)\b/u.test(text)||
+    /эпитаф|надпис|имени при рожд|полное имя|настоящее имя/u.test(text)
+  )){
+    score+=18;
   }
 
   return score;
+}
+
+function bestEvidenceChunk(page,terms,query){
+  const chunks=Array.isArray(page.chunks)&&page.chunks.length
+    ?page.chunks
+    :makeChunks(page.extract||'');
+
+  let best='',bestScore=-1;
+
+  for(const chunk of chunks){
+    const score=scoreEvidenceChunk(chunk,terms,query);
+    if(score>bestScore){
+      bestScore=score;
+      best=chunk;
+    }
+  }
+
+  return {
+    evidence:best||page.extract||'',
+    score:Math.max(0,bestScore)
+  };
 }
 
 async function searchGame(body) {
@@ -1652,8 +1756,8 @@ async function searchGame(body) {
   const variants = await buildQueryVariants(id, q, manifest);
 
   const terms = Array.from(new Set(
-    variants.flatMap(v => normalize(v).split(' '))
-      .filter(t => t.length > 1)
+    variants.flatMap(v => searchTokens(v))
+      .concat(queryHintTerms(q).flatMap(v => searchTokens(v)))
   ));
 
   const rank = () => (index.items || [])
@@ -1696,94 +1800,105 @@ async function searchGame(body) {
     }
   }
 
-  let top = ranked.slice(
-    0,
-    Math.min(8, Math.max(1, Number(body.limit || 5)))
-  );
+  // Re-rank a wider set so relevant passages near article ends are not missed.
+  const candidateLimit=Math.min(30,Math.max(10,Number(body.candidateLimit||30)));
+  let candidates=ranked.slice(0,candidateLimit);
+  const needsContent=[];
 
-  const needsContent = [];
-
-  for (const hit of top) {
-    const page = await readJson(
-      pageKey(id, hit.item.pageId)
-    ).catch(() => null);
-
-    if (!page || !page.extract) {
-      needsContent.push(hit.item.pageId);
-    }
+  for(const hit of candidates){
+    const page=await readJson(pageKey(id,hit.item.pageId)).catch(()=>null);
+    if(!page||!page.extract)needsContent.push(hit.item.pageId);
   }
 
-  if (needsContent.length) {
-    const extra = await enrichWikiPages(
+  if(needsContent.length){
+    const extra=await enrichWikiPages(
       id,
       manifest,
       index,
-      needsContent.slice(0, MAX_ENRICH_PAGES)
+      needsContent.slice(0,MAX_ENRICH_PAGES)
     );
 
-    liveSearch.enriched += extra.enriched;
-    liveSearch.missingContent += extra.missing;
+    liveSearch.enriched+=extra.enriched;
+    liveSearch.missingContent+=extra.missing;
     liveSearch.errors.push(...extra.errors);
 
-    if (extra.enriched) {
-      ranked = rank();
+    if(extra.enriched){
+      ranked=rank();
+      candidates=ranked.slice(0,candidateLimit);
     }
-
-    top = ranked.slice(
-      0,
-      Math.min(8, Math.max(1, Number(body.limit || 5)))
-    );
   }
 
-  const results = [];
+  const evaluated=[];
+  let indexChanged=false;
 
-  for (const hit of top) {
-    const page = await readJson(
-      pageKey(id, hit.item.pageId)
-    );
+  for(let offset=0;offset<candidates.length;offset+=8){
+    const group=candidates.slice(offset,offset+8);
 
-    if (!page) continue;
+    const loaded=await Promise.all(group.map(async hit=>{
+      const page=await readJson(
+        pageKey(id,hit.item.pageId)
+      ).catch(()=>null);
 
-    let best = page.chunks && page.chunks[0] ||
-      page.extract ||
-      '';
+      if(!page||!page.extract)return null;
 
-    let bestScore = -1;
+      const refreshed=makeIndexItem(page);
+      const at=index.items.findIndex(x=>x.pageId===page.pageId);
 
-    for (const chunk of (page.chunks || [])) {
-      const n = normalize(chunk);
-
-      const score = terms.reduce(
-        (a, t) => a + (n.includes(t) ? 1 : 0),
-        0
-      );
-
-      if (score > bestScore) {
-        bestScore = score;
-        best = chunk;
+      if(at>=0){
+        if(JSON.stringify(index.items[at])!==JSON.stringify(refreshed)){
+          index.items[at]=refreshed;
+          indexChanged=true;
+        }
+      }else{
+        index.items.push(refreshed);
+        indexChanged=true;
       }
-    }
 
-    const evidence = String(best).slice(0, 1800);
-    const isRussian = /[а-яё]/i.test(page.title + ' ' + evidence);
+      const picked=bestEvidenceChunk(page,terms,q);
 
-    results.push({
-      title: page.title,
-      url: page.url,
-      revisionId: page.revisionId,
-      categories: page.categories,
-      score: hit.score,
-      evidence,
-      contentAvailable: !!page.extract,
-      contentLength: page.contentLength || (page.extract || '').length,
-      contentSource: page.contentSource ||
-        (page.extract ? 'stored' : 'missing'),
-      source: manifest.source.siteName,
-      language: isRussian
-        ? 'ru'
-        : (manifest.source.language || 'unknown')
-    });
+      return {
+        item:refreshed,
+        page,
+        evidence:String(picked.evidence||'').slice(0,2000),
+        evidenceScore:picked.score,
+        score:hit.score+Math.min(90,picked.score*3)
+      };
+    }));
+
+    evaluated.push(...loaded.filter(Boolean));
   }
+
+  if(indexChanged)await writeJson(indexKey(id),index);
+
+  evaluated.sort((a,b)=>
+    b.score-a.score||b.evidenceScore-a.evidenceScore
+  );
+
+  const requestedLimit=Math.min(8,Math.max(1,Number(body.limit||5)));
+  const selected=evaluated
+    .filter(x=>x.evidenceScore>0)
+    .slice(0,requestedLimit);
+
+  const results=selected.map(hit=>{
+    const page=hit.page;
+    const evidence=hit.evidence;
+    const isRussian=/[а-яё]/i.test(page.title+' '+evidence);
+
+    return {
+      title:page.title,
+      url:page.url,
+      revisionId:page.revisionId,
+      categories:page.categories,
+      score:hit.score,
+      evidenceScore:hit.evidenceScore,
+      evidence,
+      contentAvailable:!!page.extract,
+      contentLength:page.contentLength||(page.extract||'').length,
+      contentSource:page.contentSource||(page.extract?'stored':'missing'),
+      source:manifest.source.siteName,
+      language:isRussian?'ru':(manifest.source.language||'unknown')
+    };
+  });
 
   return {
     status: results.length
@@ -1964,6 +2079,12 @@ module.exports.handler = async function (event) {
 
 module.exports._test = {
   normalize,
+  searchTokens,
+  stemSearchToken,
+  isRealNameIntent,
+  queryHintTerms,
+  scoreEvidenceChunk,
+  bestEvidenceChunk,
   slug,
   stripHtml,
   stripWikitext,
