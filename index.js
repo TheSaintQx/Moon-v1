@@ -1,177 +1,94 @@
 'use strict';
 
-// Moon-vision async adapter v1.0
+// Moon-skill async adapter v1.0
 // Entry point: index.handler
-// Keep the current v2.8.4.12 implementation unchanged as moon-vision-core.js.
-// Normal HTTPS calls are passed straight through to the core.
-// Async HTTPS calls (?integration=async) are delivered as a raw body; this
-// adapter converts that body into the HTTP event expected by the existing core.
+// Keep the current v9.6-a-v3.7 skill implementation unchanged as
+// moon-skill-core.js. This adapter transparently converts only question POSTs
+// into Yandex Cloud Functions asynchronous invocations. GET answer/ping/stats
+// calls and game-selection POSTs remain ordinary synchronous HTTPS requests.
 
-const core = require('./moon-vision-core.js');
+const crypto = require('crypto');
+const CLOUD_URL = 'https://functions.yandexcloud.net/d4el6hpg7nh0cui52kd2';
+const nativeFetch = globalThis.fetch.bind(globalThis);
 
-const MAX_ASYNC_WORK_MS = 110000;
-const POLL_INTERVAL_MS = 900;
-const VERSION = 'mv-async-adapter-1.0';
-
-function rawToText(value) {
-  if (Buffer.isBuffer(value)) return value.toString('utf8');
-  if (value instanceof Uint8Array) return Buffer.from(value).toString('utf8');
-  if (typeof value === 'string') return value;
-  return '';
+function getRequestUrl(input) {
+  if (typeof input === 'string' || input instanceof URL) return new URL(input);
+  if (input && typeof input.url === 'string') return new URL(input.url);
+  return null;
 }
 
-function readAsyncPayload(event) {
-  // A normal HTTPS invocation has httpMethod and must use the original route.
-  if (event && typeof event === 'object' &&
-      typeof event.httpMethod === 'string') {
-    return null;
-  }
+function parseJsonBody(body) {
+  if (typeof body !== 'string') return null;
+  try { return JSON.parse(body); } catch (e) { return null; }
+}
 
-  let source = event;
-  if (source && typeof source === 'object' && !Buffer.isBuffer(source) &&
-      !(source instanceof Uint8Array)) {
-    if (source.body !== undefined) source = source.body;
-    else if (source.data !== undefined) source = source.data;
-    else if (typeof source.token === 'string') return source;
+function qidFromCid(cid) {
+  return parseInt(
+    crypto.createHash('sha256').update(String(cid)).digest('hex').slice(0, 12),
+    16
+  ) || 1;
+}
 
-    if (source && typeof source === 'object' &&
-        !Buffer.isBuffer(source) && !(source instanceof Uint8Array) &&
-        typeof source.token === 'string') {
-      return source;
+// Intercept exactly the existing Moon-vision POST /?token=... request whose
+// JSON body contains q. setGame POSTs have only game and are not intercepted.
+globalThis.fetch = async function (input, init) {
+  const options = init || {};
+  const method = String(options.method ||
+    (input && input.method) || 'GET').toUpperCase();
+
+  if (method === 'POST') {
+    let requestUrl = null;
+    try { requestUrl = getRequestUrl(input); } catch (e) { requestUrl = null; }
+
+    if (requestUrl && requestUrl.origin + requestUrl.pathname === CLOUD_URL &&
+        requestUrl.searchParams.has('token')) {
+      const payload = parseJsonBody(options.body);
+
+      if (payload && typeof payload.q === 'string' && payload.q.trim() &&
+          typeof payload.cid === 'string' && payload.cid) {
+        const token = requestUrl.searchParams.get('token');
+        const asyncPayload = Object.assign({}, payload, {
+          action: 'ask',
+          token: token
+        });
+
+        const asyncUrl = CLOUD_URL + '?integration=async';
+        const response = await nativeFetch(asyncUrl, Object.assign({}, options, {
+          body: JSON.stringify(asyncPayload)
+        }));
+
+        if (response.status === 202) {
+          const cid = payload.cid;
+          const qid = qidFromCid(cid);
+
+          console.log(JSON.stringify({
+            component: 'moon-skill-async',
+            status: 'accepted',
+            qid: qid
+          }));
+
+          // The unchanged skill core expects a synchronous {status:'query',
+          // qid, cid} response. Return that internally after Yandex accepted
+          // the async invocation; the user still sees the normal skill reply.
+          return new Response(JSON.stringify({
+            status: 'query',
+            qid: qid,
+            cid: cid,
+            async: true
+          }), {
+            status: 200,
+            headers: { 'content-type': 'application/json; charset=utf-8' }
+          });
+        }
+
+        // Preserve any real error response; do not disguise it as accepted.
+        return response;
+      }
     }
   }
 
-  const text = rawToText(source);
-  if (!text) return null;
-
-  try {
-    return JSON.parse(text);
-  } catch (e) {
-    throw new Error('Async invocation body is not valid JSON');
-  }
-}
-
-function parseCoreBody(result) {
-  if (!result || typeof result !== 'object') return null;
-  let body = result.body;
-  if (Buffer.isBuffer(body)) body = body.toString('utf8');
-  if (typeof body === 'string') {
-    try { return JSON.parse(body); } catch (e) { return null; }
-  }
-  return body && typeof body === 'object' ? body : null;
-}
-
-function makePostEvent(payload) {
-  const body = {
-    q: String(payload.q || ''),
-    cid: String(payload.cid || ''),
-    uid: String(payload.uid || '')
-  };
-  if (payload.game) body.game = String(payload.game);
-  if (payload.supersede) body.supersede = String(payload.supersede);
-
-  return {
-    httpMethod: 'POST',
-    headers: { 'content-type': 'application/json' },
-    queryStringParameters: { token: String(payload.token || '') },
-    body: JSON.stringify(body),
-    isBase64Encoded: false
-  };
-}
-
-function makeAnswerEvent(payload, qid) {
-  return {
-    httpMethod: 'GET',
-    headers: {},
-    queryStringParameters: {
-      token: String(payload.token || ''),
-      answer: '1',
-      qid: String(qid),
-      cid: String(payload.cid || ''),
-      uid: String(payload.uid || '')
-    }
-  };
-}
-
-function isTerminal(status) {
-  return status === 'done' || status === 'clarify' ||
-    status === 'expired' || status === 'superseded' ||
-    status === 'cancelled' || status === 'none' ||
-    status === 'bad_request' || status === 'forbidden';
-}
-
-async function runCore(event, context) {
-  const result = await core.handler(event, context);
-  const data = parseCoreBody(result);
-
-  if (!data) {
-    throw new Error('Moon-vision core returned an unreadable response');
-  }
-
-  if ((result && result.statusCode >= 500) ||
-      data.status === 'server_error' || data.status === 'wait') {
-    throw new Error('Moon-vision core temporary failure: ' + data.status);
-  }
-
-  return { result, data };
-}
-
-module.exports.handler = async function (event, context) {
-  // Keep every existing synchronous endpoint operational.
-  if (event && typeof event === 'object' &&
-      typeof event.httpMethod === 'string') {
-    return core.handler(event, context);
-  }
-
-  const payload = readAsyncPayload(event);
-  if (!payload) {
-    throw new Error('Unknown asynchronous invocation format');
-  }
-
-  if (payload.action !== 'ask' ||
-      typeof payload.token !== 'string' || !payload.token ||
-      typeof payload.q !== 'string' || !payload.q.trim() ||
-      typeof payload.cid !== 'string' || !payload.cid) {
-    throw new Error('Invalid asynchronous ask payload');
-  }
-
-  const startedAt = Date.now();
-  const first = await runCore(makePostEvent(payload), context);
-  let data = first.data;
-
-  if (isTerminal(data.status)) {
-    console.log(JSON.stringify({
-      component: 'moon-vision-async', version: VERSION,
-      status: data.status, qid: data.qid || null
-    }));
-    return { status: data.status, qid: data.qid || null };
-  }
-
-  // The core normally completes the work during the POST itself. If it reports
-  // query, poll the existing synchronous answer endpoint from this same async
-  // execution. Pending records can also be resumed by that endpoint.
-  const qid = Number(data.qid);
-  if (!Number.isSafeInteger(qid) || qid <= 0) {
-    throw new Error('Moon-vision did not return a valid qid');
-  }
-
-  while (Date.now() - startedAt < MAX_ASYNC_WORK_MS) {
-    await new Promise(resolve => setTimeout(resolve, POLL_INTERVAL_MS));
-
-    const polled = await runCore(makeAnswerEvent(payload, qid), context);
-    data = polled.data;
-
-    if (isTerminal(data.status)) {
-      console.log(JSON.stringify({
-        component: 'moon-vision-async', version: VERSION,
-        status: data.status, qid: qid,
-        elapsedMs: Date.now() - startedAt
-      }));
-      return { status: data.status, qid: qid };
-    }
-  }
-
-  // Throw so the platform can apply the configured asynchronous retry policy.
-  // The existing core's CID check prevents creation of a second logical query.
-  throw new Error('Moon-vision async work did not finish within the execution budget');
+  return nativeFetch(input, init);
 };
+
+const core = require('./moon-skill-core.js');
+module.exports.handler = core.handler;
