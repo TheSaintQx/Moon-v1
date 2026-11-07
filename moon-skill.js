@@ -2,12 +2,13 @@
 
 const crypto = require('crypto');
 
-// Moon Skill v9.6-a-v3.6-moon-v1
+// Moon Skill v9.6-a-v3.7-moon-v1
 // Изменения:
-// - согласованные тайм-ауты в пределах бюджета одного ответа;
-// - AbortError также распознаётся как тайм-аут;
-// - вопросительная фраза не принимается за название игры;
-// - сохранены команды смены игры и восстановления состояния.
+// - повторная проверка готовности ответа в безопасном бюджете Alice;
+// - восстановление ответа по UID, даже если тестер не передал state;
+// - отсутствие локального TTL-блокирования запроса к Moon-vision;
+// - чтение сохранённого состояния из нескольких форматов Alice;
+// - сохранена универсальная работа со всеми играми.
 
 const CLOUD_URL = 'https://functions.yandexcloud.net/d4el6hpg7nh0cui52kd2';
 
@@ -15,14 +16,14 @@ const CLOUD_URL = 'https://functions.yandexcloud.net/d4el6hpg7nh0cui52kd2';
 const TOKEN = 'moon-7f3k9p2xq8v4m1w6r5t0zc4';
 const TOKEN_PLACEHOLDER = '__SET_TOKEN_HERE__';
 
-const TURN_BUDGET_MS    = 3700;
-const SAFETY_MS         = 350;
-const ASK_TIMEOUT_MS    = 2300;
-const ANSWER_TIMEOUT_MS = 850;
-const POLL_STEP_MS      = 450;
+const TURN_BUDGET_MS    = 4300;
+const SAFETY_MS         = 400;
+const ASK_TIMEOUT_MS    = 2200;
+const ANSWER_TIMEOUT_MS = 1200;
+const POLL_STEP_MS      = 250;
 const FOLLOWUP_TTL_MS   = 120000;
 const FOLLOWUP_CEIL_MS  = 300000;
-const VER               = '9.6-a-v3.6-moon-v1';
+const VER               = '9.6-a-v3.7-moon-v1';
 const VOICE_MAX         = 400;
 
 function isTokenConfigured() {
@@ -391,33 +392,48 @@ async function pollAnswer(qid, cid, untilMs, uid) {
     const r = await answer(
       qid,
       cid,
-      Math.min(1200, remaining),
+      Math.min(ANSWER_TIMEOUT_MS, remaining),
       uid
     );
 
-    if (r.kind !== 'ok') {
-      if (Date.now() + POLL_STEP_MS > untilMs) return null;
+    const body = r.body || {};
+    const status = String(body.status || '');
 
-      await new Promise(res => setTimeout(res, POLL_STEP_MS));
-      continue;
-    }
-
-    if (r.body &&
-      (r.body.status === 'done' || r.body.status === 'clarify')) {
+    // Проверяем тело и при HTTP 409: Moon-vision может вернуть
+    // expired с полезным JSON-телом и неуспешным HTTP-кодом.
+    if (status === 'done' || status === 'clarify') {
       return {
-        text: String(r.body.text || ''),
-        clarify: r.body.status === 'clarify',
-        meta: r.body
+        text: String(body.text || ''),
+        clarify: status === 'clarify',
+        meta: body
       };
     }
 
-    if (r.body &&
-      (r.body.status === 'expired' ||
-       r.body.status === 'superseded' ||
-       r.body.status === 'cancelled')) {
+    if (status === 'expired' ||
+        status === 'superseded' ||
+        status === 'cancelled') {
       return { expired: true };
     }
 
+    if (status === 'none') {
+      return { none: true };
+    }
+
+    if (r.kind === 'config') {
+      return { error: 'config' };
+    }
+
+    if (r.kind === 'http' && r.status === 403) {
+      return { error: 'auth' };
+    }
+
+    if (r.kind === 'http' &&
+        status && status !== 'query' && status !== 'pending') {
+      return { error: 'http', httpStatus: r.status, status: status };
+    }
+
+    // query/pending означает, что ответ ещё готовится.
+    // Повторяем короткие запросы до безопасного предела Alice.
     if (Date.now() + POLL_STEP_MS > untilMs) return null;
 
     await new Promise(res => setTimeout(res, POLL_STEP_MS));
@@ -427,11 +443,23 @@ async function pollAnswer(qid, cid, untilMs, uid) {
 }
 
 function loadState(req) {
-  const st = (req && req.state) || {};
+  const r = req || {};
+  const st = r.state || {};
+
+  // В разных оболочках и тестерах Alice state может находиться
+  // внутри state либо приходить отдельными полями верхнего уровня.
+  const candidates = [
+    st.session,
+    st.application,
+    st.user,
+    r.session_state,
+    r.application_state,
+    r.user_state_update
+  ];
 
   let best = null;
 
-  for (const c of [st.session, st.application, st.user]) {
+  for (const c of candidates) {
     if (!c || typeof c !== 'object' || !Object.keys(c).length) {
       continue;
     }
@@ -721,63 +749,46 @@ module.exports.handler = async function (event) {
       );
     }
 
-    if (uState.followUpUntil &&
-      Date.now() > uState.followUpUntil) {
-      route('followup-ttl');
-
-      clearPending(uState);
-
-      return reply(
-        'Ответ не успел собраться. Спроси ещё раз.',
-        false,
-        'expired'
-      );
-    }
-
-    const r = await answer(
+    // Локальный таймер Alice не является источником истины.
+    // Даже если state не пришёл или его TTL истёк, проверяем Moon-vision
+    // по qid/cid, а при их отсутствии — по UID пользователя.
+    const got = await pollAnswer(
       uState.qid || 0,
       uState.cid,
-      turnDeadline - Date.now() - SAFETY_MS,
+      turnDeadline - SAFETY_MS,
       uid
     );
 
-    if (r.body &&
-      (r.body.status === 'done' || r.body.status === 'clarify')) {
+    if (got && got.text) {
       route(
-        r.body.status === 'clarify'
+        got.clarify
           ? 'followup-clarify'
           : 'followup-done'
       );
 
       clearPending(uState);
 
-      const t = String(r.body.text || '');
-
       return reply(
-        t ? t : 'Честно: пока не знаю. Спроси иначе.',
+        got.text,
         false,
-        r.body.status === 'clarify'
-          ? 'clarify'
-          : (t ? 'done' : 'done-empty'),
-        r.body
+        got.clarify ? 'clarify' : 'done',
+        got.meta
       );
     }
 
-    if (r.body &&
-      (r.body.status === 'superseded' ||
-       r.body.status === 'cancelled')) {
-      route('followup-superseded');
+    if (got && got.expired) {
+      route('followup-expired');
 
       clearPending(uState);
 
       return reply(
-        'Этот запрос уже заменён новым. Скажи «ну что там» после нового вопроса.',
+        'Срок хранения этого ответа истёк. Задай вопрос ещё раз.',
         false,
-        'superseded'
+        'expired'
       );
     }
 
-    if (r.body && r.body.status === 'none') {
+    if (got && got.none) {
       route('followup-none');
 
       clearPending(uState);
@@ -785,63 +796,39 @@ module.exports.handler = async function (event) {
       return reply(
         hasLocal
           ? 'Не нашла запрос, который нужно проверить. Задай вопрос ещё раз.'
-          : 'Я пока ничего не собирала. Задай вопрос.',
+          : 'Не нашла незавершённый вопрос. Задай его ещё раз.',
         false,
         'none'
       );
     }
 
-    if (r.body && r.body.status === 'expired') {
-      route('followup-expired');
-
-      clearPending(uState);
-
-      return reply(
-        'Ответ не успел собраться. Спроси ещё раз.',
-        false,
-        'expired'
-      );
-    }
-
-    if (r.kind === 'config') {
+    if (got && got.error === 'config') {
       route('followup-config');
 
       return reply(
-        'Токен сервера не настроен. Проверь токен в коде навыка и AUTH_TOKEN в moon-vision.',
+        'Сервис ответа не настроен. Нужна проверка конфигурации Moon-vision.',
         false,
         'config'
       );
     }
 
-    if (r.kind === 'http' && r.status === 403) {
+    if (got && got.error === 'auth') {
       route('followup-auth');
 
       return reply(
-        'Сервер отклонил токен. Проверь совпадение токена в навыке и AUTH_TOKEN в moon-vision.',
+        'Moon-vision отклонил запрос. Требуется проверить подключение навыка.',
         false,
         'auth-error'
       );
     }
 
-    if (r.kind === 'network' || r.kind === 'http') {
-      route('followup-network');
+    if (got && got.error) {
+      route('followup-http');
 
       return reply(
-        'Связь с сервером подвела. Скажи «ну что там» ещё раз.',
+        'Moon-vision ответил ошибкой. Попробуй повторить вопрос.',
         false,
-        'network'
-      );
-    }
-
-    if (r.kind === 'timeout') {
-      route('followup-wait');
-
-      slideFollowUp(uState);
-
-      return reply(
-        'Ещё собираю. Скажи «ну что там» через минуту.',
-        false,
-        'wait'
+        'http-error'
       );
     }
 
@@ -849,21 +836,8 @@ module.exports.handler = async function (event) {
 
     slideFollowUp(uState);
 
-    const seen = uState.followUpFrom
-      ? Math.round((Date.now() - uState.followUpFrom) / 1000)
-      : 0;
-
-    if (!seen) {
-      return reply(
-        'Ещё собираю. Скажи «ну что там» через минуту.',
-        false,
-        'pending'
-      );
-    }
-
     return reply(
-      'Ещё собираю, прошло около ' + seen + ' ' +
-      pluralSec(seen) + '. Скажи «ну что там» позже.',
+      'Сервер ещё обрабатывает вопрос. Скажи «ну что там» через несколько секунд.',
       false,
       'pending'
     );
@@ -939,7 +913,7 @@ module.exports.handler = async function (event) {
       if (sg.kind === 'config') {
         return reply(
           'Запомнила игру «' + g +
-          '» в навыке, но токен сервера ещё не настроен. Проверь токен в коде навыка и AUTH_TOKEN в moon-vision.',
+          '» в навыке, но сервер не настроен. Нужна проверка подключения.',
           false,
           'config'
         );
@@ -948,7 +922,7 @@ module.exports.handler = async function (event) {
       if (sg.status === 403) {
         return reply(
           'Запомнила игру «' + g +
-          '» в навыке, но сервер отклонил токен. Проверь совпадение токена в навыке и AUTH_TOKEN в moon-vision.',
+          '» в навыке, но сервер отклонил запрос. Нужна проверка подключения.',
           false,
           'auth-error'
         );
@@ -1078,7 +1052,7 @@ module.exports.handler = async function (event) {
     slideFollowUp(uState);
 
     return reply(
-      'Собираю ответ. Через минуту скажи «ну что там».',
+      'Собираю ответ. Через несколько секунд скажи «ну что там».',
       false,
       'pending'
     );
@@ -1112,7 +1086,7 @@ module.exports.handler = async function (event) {
     slideFollowUp(uState);
 
     return reply(
-      'Этот вопрос уже собирается. Через минуту скажи «ну что там».',
+      'Этот вопрос уже собирается. Через несколько секунд скажи «ну что там».',
       false,
       'cid-conflict'
     );
@@ -1126,7 +1100,7 @@ module.exports.handler = async function (event) {
     slideFollowUp(uState);
 
     return reply(
-      'Этот вопрос уже заменён новым. Через минуту скажи «ну что там».',
+      'Этот вопрос уже заменён новым. Через несколько секунд скажи «ну что там».',
       false,
       'superseded'
     );
@@ -1150,7 +1124,7 @@ module.exports.handler = async function (event) {
     slideFollowUp(uState);
 
     return reply(
-      'Собираю ответ. Через минуту скажи «ну что там».',
+      'Запрос передан серверу. Скажи «ну что там» через несколько секунд.',
       false,
       'pending'
     );
@@ -1162,7 +1136,7 @@ module.exports.handler = async function (event) {
     slideFollowUp(uState);
 
     return reply(
-      'Собираю ответ. Через минуту скажи «ну что там».',
+      'Сервер принял запрос. Скажи «ну что там» через несколько секунд.',
       false,
       'protocol'
     );
@@ -1188,5 +1162,6 @@ module.exports._test = {
   normGame,
   isChangeGame,
   cleanGameCandidate,
-  isTokenConfigured
+  isTokenConfigured,
+  pollAnswer
 };
