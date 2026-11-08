@@ -1,15 +1,15 @@
 'use strict';
 
-// moon-vision v2.8.4.12 — Moon v1: KB-диагностика, X-KB-Token, per-uid game.
-// Основа: v2.8.4.10 — серия 1024px, burst кадров, точные названия с кадра.
-// v2.8.4.12:
-//   (1) Knowledge Engine вызывается через X-KB-Token, а не Authorization.
-//   (2) Статусы KB сохраняются: needs_wiki, indexing, no_evidence,
-//       forbidden, timeout, unavailable, bad_json и другие.
-//   (3) Ошибка KB не маскируется ответом об отсутствии кадров.
-//   (4) Глобальная игра не подставляется UID, если уже есть другая активная
-//       пользовательская игра.
-//   (5) Совместимо с протоколом навыка Moon v3.6.
+// moon-vision v2.9.0 — Moon v1: быстрый ответ, answer_ready для оверлея,
+// кэш готовых ответов и память контекста беседы.
+// Основа: v2.8.4.12 — KB-диагностика, X-KB-Token, per-uid game.
+// v2.9.0:
+//   (1) KB ищется в два этапа: сначала fast (локальный индекс, без вики),
+//       только потом полный поиск. Это сокращает время ответа в разы.
+//   (2) Готовый ответ кэшируется: повторный вопрос отвечается сразу.
+//   (3) answer_ready в ответе оверлея + ?ack=1 и ?ready=1.
+//   (4) ?progress=1 — состояние задачи без запуска обработки.
+//   (5) Короткие уточнения («а кем основан?») получают контекст прошлого вопроса.
 // Стиль, цвет и геометрия оверлея не меняются.
 const crypto = require('crypto');
 
@@ -38,10 +38,18 @@ const MAX_GAME = 60;
 const MAX_BODY = 2 * 1024 * 1024;
 const MARKER_INTERVAL_S = 3;
 const MARKER_FRESH_S = 5;
-const BACKEND_VERSION = '2.8.4.12';
+const BACKEND_VERSION = '2.9.0';
 const KB_URL = process.env.KB_URL || '';
 const KB_TOKEN = process.env.KB_TOKEN || '';
-const KB_TIMEOUT_MS = 10000;
+const KB_TIMEOUT_MS = 8000;
+// Быстрый локальный поиск: только индекс, без вики и без записи в S3.
+const KB_FAST_TIMEOUT_MS = 2600;
+const KB_FAST_RESULTS = 3;
+// Кэш готовых ответов: повторный вопрос отвечается без поиска и модели.
+const QCACHE_TTL_S = 1800;
+const KEEP_QCACHE = 24;
+// Сколько живёт невыданное уведомление answer_ready для оверлея.
+const READY_TTL_S = 120;
 const KB_MAX_RESULTS = 5;
 const KB_MAX_EVIDENCE_CHARS = 1400;
 const KB_MAX_TOTAL_CHARS = 6500;
@@ -123,6 +131,7 @@ function blankState() {
     marker: null,
     markerSetAt: 0,
     answers: {},
+    qcache: {},
     users: {}
   };
 }
@@ -338,6 +347,16 @@ function mergeState(st, cur, now) {
 
   m.answers = merged;
 
+  // Кэш ответов переживает слияние: повторный вопрос не должен теряться.
+  const qc = Object.assign({}, cur.qcache || {});
+
+  for (const [k, v] of Object.entries(st.qcache || {})) {
+    const c = qc[k];
+    if (!c || (v && (v.at || 0) >= (c.at || 0))) qc[k] = v;
+  }
+
+  m.qcache = qc;
+
   const us = Object.assign({}, cur.users || {});
 
   for (const [u, rec] of Object.entries(st.users || {})) {
@@ -374,6 +393,19 @@ function pruneState(m) {
     for (const id of terminal) {
       if (overflow-- <= 0) break;
       delete ans[id];
+    }
+  }
+
+  const qcache = m.qcache || {};
+  const qkeys = Object.keys(qcache);
+
+  if (qkeys.length > KEEP_QCACHE) {
+    qkeys.sort((a, b) =>
+      ((qcache[a] && qcache[a].at) || 0) -
+      ((qcache[b] && qcache[b].at) || 0));
+
+    for (const k of qkeys.slice(0, qkeys.length - KEEP_QCACHE)) {
+      delete qcache[k];
     }
   }
 
@@ -507,11 +539,12 @@ function normalizeKbResults(payload) {
   };
 }
 
-async function searchKnowledge(game, q) {
+async function searchKnowledge(game, q, fast) {
   if (!KB_URL || !KB_TOKEN) {
     return { status: 'not_configured', results: [] };
   }
 
+  const quick = fast === true;
   let res;
 
   try {
@@ -526,9 +559,12 @@ async function searchKnowledge(game, q) {
         action: 'search',
         game: game,
         query: q,
-        limit: KB_MAX_RESULTS
+        limit: quick ? KB_FAST_RESULTS : KB_MAX_RESULTS,
+        fast: quick
       }),
-      signal: AbortSignal.timeout(KB_TIMEOUT_MS)
+      signal: AbortSignal.timeout(
+        quick ? KB_FAST_TIMEOUT_MS : KB_TIMEOUT_MS
+      )
     });
   } catch (e) {
     return {
@@ -557,6 +593,124 @@ async function searchKnowledge(game, q) {
   }
 
   return normalizeKbResults(payload);
+}
+
+// ---------- кэш готовых ответов ----------
+
+function qcacheKey(uid, game, nq) {
+  return crypto.createHash('sha256')
+    .update(String(uid || '') + '\n' +
+      normalize(game || '') + '\n' + normalize(nq || ''))
+    .digest('hex').slice(0, 24);
+}
+
+function qcacheLookup(st, uid, game, nq) {
+  const hit = (st.qcache || {})[qcacheKey(uid, game, nq)];
+
+  if (!hit || typeof hit.text !== 'string' || !hit.text) return null;
+
+  if (nowS() - (hit.at || 0) > QCACHE_TTL_S) return null;
+
+  return hit;
+}
+
+function qcacheStore(st, rec) {
+  if (!rec || !rec.text || rec.status !== 'done') return;
+  if (rec.unk === true || rec.src === 'none') return;
+
+  st.qcache = st.qcache || {};
+  st.qcache[qcacheKey(rec.uid, rec.game, rec.q)] = {
+    text: String(rec.text).slice(0, MAX_ANSWER),
+    src: rec.src || 'none',
+    conf: typeof rec.conf === 'number' ? rec.conf : null,
+    at: nowS(),
+    qid: Number(rec.qid || 0)
+  };
+}
+
+// ---------- память контекста ----------
+
+const CTX_LEAD_RE = /^(?:а|и|ну|тогда|еще|ещё)\s+/;
+const CTX_QUESTION_RE = /^(?:кем|где|когда|сколько|какой|какая|какое|какие|каких|какого|чем|кто|почему|зачем|чей|чьи|что)$/;
+const CTX_PRONOUN_RE = /(?:^|\s)(?:он|она|оно|они|его|ее|их|этот|эта|это|этом|этому|нем|ней|них|там)(?:\s|$)/;
+
+function lastDoneRec(st, uid) {
+  let best = null;
+
+  for (const id of Object.keys(st.answers || {})) {
+    const rec = st.answers[id];
+
+    if (!rec || rec.status !== 'done' || !rec.q) continue;
+    if (uid && rec.uid && rec.uid !== uid) continue;
+    if (rec.unk === true) continue;
+
+    const t = rec.doneAtMs || (rec.doneAt || 0) * 1000 ||
+      rec.createdAtMs || 0;
+
+    if (!best || t > best.t) best = { id: id, rec: rec, t: t };
+  }
+
+  return best;
+}
+
+// «а кем основан?», «кем?», «а его оружие?» относятся к прошлому вопросу.
+// Склеиваем только короткие уточнения, чтобы не портить самостоятельные вопросы.
+function contextualQuery(st, uid, nq) {
+  const s = String(nq || '').trim();
+  const words = s.split(/\s+/).filter(Boolean);
+
+  if (!s || !words.length) return { query: s, ctx: '', prevId: '' };
+
+  const bareQuestion = words.length === 1 && CTX_QUESTION_RE.test(s);
+  const leadsOn = CTX_LEAD_RE.test(s) && words.length <= 5;
+  const pronoun = CTX_PRONOUN_RE.test(s) && words.length <= 5;
+
+  if (!bareQuestion && !leadsOn && !pronoun) {
+    return { query: s, ctx: '', prevId: '' };
+  }
+
+  const prev = lastDoneRec(st, uid);
+
+  if (!prev || !prev.rec.q || prev.rec.q === s) {
+    return { query: s, ctx: '', prevId: '' };
+  }
+
+  return {
+    query: (prev.rec.q + ' ' + s).slice(0, MAX_Q),
+    ctx: String(prev.rec.q).slice(0, MAX_Q),
+    prevId: prev.id
+  };
+}
+
+// ---------- answer_ready для оверлея ----------
+
+function readyFor(st) {
+  const entries = Object.keys(st.answers || {})
+    .map(id => ({ id: id, rec: st.answers[id] }))
+    .filter(x => x.rec &&
+      x.rec.status === 'done' &&
+      !x.rec.ackedAt &&
+      x.rec.show !== true &&
+      String(x.rec.text || '').trim())
+    .sort((a, b) =>
+      ((b.rec.doneAtMs || (b.rec.doneAt || 0) * 1000) -
+       (a.rec.doneAtMs || (a.rec.doneAt || 0) * 1000)));
+
+  if (!entries.length) return null;
+
+  const best = entries[0];
+  const doneAt = best.rec.doneAtMs || (best.rec.doneAt || 0) * 1000;
+
+  if (!doneAt || Date.now() - doneAt > READY_TTL_S * 1000) return null;
+
+  return {
+    type: 'answer_ready',
+    qid: Number(best.id),
+    text: String(best.rec.text || '').slice(0, MAX_ANSWER),
+    at: doneAt,
+    src: best.rec.src || 'none',
+    unk: best.rec.unk === true
+  };
 }
 
 function kbStatusText(status) {
@@ -999,6 +1153,9 @@ async function saveClaimResult(id, claimId, out) {
       cur.obj.markerSetAt = Date.now();
     }
 
+    // Кэшируем непустой подтверждённый ответ для мгновенного повтора.
+    qcacheStore(cur.obj, Object.assign({}, rec, { qid: id }));
+
     let r = null;
 
     try {
@@ -1054,31 +1211,39 @@ async function processOne(st, id) {
   st.qid = fresh.qid;
 
   const show = isShow(mine.q);
+  // Уточнение из прошлой реплики ищем вместе с исходным вопросом.
+  const searchQ = mine.searchQ || mine.q;
+  const qEff = mine.ctx
+    ? (mine.ctx + ' — ' + mine.q).slice(0, MAX_Q)
+    : mine.q;
   let frameInfo = null;
   let out = null;
   let kbStatus = 'not_attempted';
+  let kbFast = false;
 
   // KB-first: запросы показа и неразрешённые местоимения сюда не попадают.
   if (!show && mine.game && !hasUnresolvedReferent(mine.q)) {
-    const kb = await searchKnowledge(mine.game, mine.q);
-    kbStatus = kb.status || 'bad_response';
+    // Одна попытка «поиск + модель». Возвращает готовый ответ или null.
+    const tryKb = async (payload) => {
+      if (!Array.isArray(payload.results) || !payload.results.length) {
+        return null;
+      }
 
-    if (Array.isArray(kb.results) && kb.results.length) {
       try {
         const kbParsed = parseAnswer(
-          await callKnowledgeModel(mine.game, mine.q, kb.results),
+          await callKnowledgeModel(mine.game, qEff, payload.results),
           false
         );
 
         if (!kbParsed.unk && !kbParsed.clarify) {
-          out = Object.assign({}, kbParsed, {
+          return Object.assign({}, kbParsed, {
             src: 'kb',
             frame_id: null,
             resultStatus: 'done'
           });
-        } else {
-          kbStatus = 'insufficient_evidence';
         }
+
+        kbStatus = 'insufficient_evidence';
       } catch (e) {
         kbStatus = 'model_error';
         console.error(
@@ -1086,8 +1251,35 @@ async function processOne(st, id) {
           (e && e.name ? e.name : 'error')
         );
       }
-    } else if (kbStatus === 'ok') {
-      kbStatus = 'no_evidence';
+
+      return null;
+    };
+
+    // Сначала быстрый локальный поиск — он укладывается в реплику Алисы.
+    const fastRes = await searchKnowledge(mine.game, searchQ, true);
+    kbFast = !!(fastRes.results && fastRes.results.length);
+
+    if (kbFast) {
+      out = await tryKb(fastRes);
+    } else {
+      kbStatus = fastRes.status || 'bad_response';
+    }
+
+    // Быстрый индекс ничего не дал или модель не нашла ответа — идём
+    // в полный поиск с вики. Ошибку базы знаний кадрами не маскируем.
+    if (!out &&
+        kbStatus !== 'not_configured' &&
+        kbStatus !== 'forbidden') {
+      const full = await searchKnowledge(mine.game, searchQ, false);
+      const hasFull = Array.isArray(full.results) && full.results.length;
+
+      if (hasFull) {
+        out = await tryKb(full);
+      } else if (full.status && full.status !== 'ok') {
+        kbStatus = full.status;
+      } else if (kbStatus === 'ok') {
+        kbStatus = 'no_evidence';
+      }
     }
   }
 
@@ -1145,7 +1337,7 @@ async function processOne(st, id) {
         const parsed = parseAnswer(
           await callModel(
             mine.game,
-            mine.q,
+            qEff,
             frameInfo.frames,
             frameInfo.frameIds,
             show
@@ -1186,6 +1378,7 @@ async function processOne(st, id) {
     ' marker=' + (out.marker ? out.marker.type : 'none') +
     ' src=' + out.src +
     ' kb=' + kbStatus +
+    ' kbfast=' + kbFast +
     ' frame=' + (out.frame_id || 'none') +
     ' unk=' + out.unk
   );
@@ -1607,16 +1800,48 @@ async function handleAsk(q, game, cidValue, supersedeValue, uidValue) {
 
   st.qid = Math.max(st.qid || 0, qid);
 
-  st.answers[String(qid)] = {
-    status: 'pending',
-    q: nq,
-    game: requestedGame,
-    cid: cid || '',
-    uid: uid,
-    show: showQ,
-    createdAt: now,
-    createdAtMs: createdAtMs
-  };
+  // Контекст прошлой реплики для коротких уточнений.
+  const ctx = showQ
+    ? { query: nq, ctx: '', prevId: '' }
+    : contextualQuery(st, uid, nq);
+
+  // Повторный вопрос отвечаем сразу из кэша: без вики и без модели.
+  // Запись всё равно создаётся, чтобы опрос по cid нашёл ответ.
+  const cached = showQ ? null : qcacheLookup(st, uid, requestedGame, nq);
+
+  st.answers[String(qid)] = cached
+    ? {
+        status: 'done',
+        q: nq,
+        game: requestedGame,
+        cid: cid || '',
+        uid: uid,
+        show: false,
+        createdAt: now,
+        createdAtMs: createdAtMs,
+        doneAt: now,
+        doneAtMs: Date.now(),
+        text: String(cached.text).slice(0, MAX_ANSWER),
+        marker: null,
+        unk: false,
+        src: 'cache',
+        frame_id: null,
+        conf: typeof cached.conf === 'number' ? cached.conf : null,
+        resultStatus: 'done'
+      }
+    : {
+        status: 'pending',
+        q: nq,
+        game: requestedGame,
+        cid: cid || '',
+        uid: uid,
+        show: showQ,
+        createdAt: now,
+        createdAtMs: createdAtMs,
+        searchQ: ctx.query !== nq ? ctx.query : '',
+        ctx: ctx.ctx,
+        contextOf: ctx.ctx ? ctx.prevId : ''
+      };
 
   st.marker = null;
   st.markerSetAt = Date.now();
@@ -1625,6 +1850,13 @@ async function handleAsk(q, game, cidValue, supersedeValue, uidValue) {
 
   if (!(await saveState(st))) {
     return { code: 503, body: { status: 'wait' } };
+  }
+
+  if (cached) {
+    return {
+      code: 200,
+      body: answerPayload(qid, st.answers[String(qid)])
+    };
   }
 
   const after = await getState();
@@ -1831,9 +2063,77 @@ function stateOut(st) {
       frameSize: st.lastFrameSize || 0,
       game: st.game || '',
       marker: emitMarker(st.marker || null),
+      ready: readyFor(st),
       version: BACKEND_VERSION
     }
   };
+}
+
+// Оверлей показывает ответ, как только он готов, и подтверждает показ через ack.
+async function handleAck(qidValue) {
+  const id = String(qidValue || '').trim();
+
+  if (!/^\d+$/.test(id)) {
+    return { code: 400, body: { status: 'bad_request' } };
+  }
+
+  const st = await getState();
+  const rec = (st.answers || {})[id];
+
+  if (!rec) {
+    return { code: 200, body: { status: 'none', qid: Number(id) } };
+  }
+
+  rec.ackedAt = nowS();
+  await saveState(st);
+
+  return { code: 200, body: { status: 'ok', qid: Number(id) } };
+}
+
+// Лёгкий опрос состояния задачи: ничего не запускает и не трогает обработку.
+async function progressOut(qp) {
+  const st = await getState();
+  const cid = cleanCid(qp.cid);
+  let id = qp.qid !== undefined && /^\d+$/.test(String(qp.qid))
+    ? String(qp.qid)
+    : '';
+
+  if (!id && cid) {
+    const found = findAnswerByCid(st, cid);
+    if (found) id = found.id;
+  }
+
+  if (!id) {
+    const latest = findLatestByUid(st, cleanUid(qp.uid));
+    if (latest) id = latest.id;
+  }
+
+  if (!id) return { code: 200, body: { status: 'none' } };
+
+  const rec = (st.answers || {})[id];
+
+  if (!rec) {
+    return { code: 200, body: { status: 'none', qid: Number(id) } };
+  }
+
+  const body = {
+    status: rec.status,
+    qid: Number(id),
+    cid: rec.cid || '',
+    elapsed_s: Math.max(0, nowS() - (rec.createdAt || 0)),
+    game: rec.game || '',
+    src: rec.src || ''
+  };
+
+  if (rec.status === 'done') {
+    body.text = String(rec.text || '').slice(0, MAX_ANSWER);
+    body.result_status = rec.resultStatus || 'done';
+    body.unk = rec.unk === true;
+    body.marker = emitMarker(rec.marker || null);
+    body.ready = !rec.ackedAt;
+  }
+
+  return { code: 200, body: body };
 }
 
 function configOut(st) {
@@ -1848,6 +2148,7 @@ function configOut(st) {
       intervalMs: MARKER_INTERVAL_S * 1000,
       game: st.game || '',
       marker: emitMarker(freshMarker(st)),
+      ready: readyFor(st),
       ts: st.lastFrameTs || 0
     }
   };
@@ -1864,6 +2165,7 @@ function pollOut(st) {
         qid: Number(fa.id),
         q: fa.rec.q || '',
         marker: emitMarker(fa.rec.marker),
+        ready: readyFor(st),
         frame_id: fa.rec.frame_id || null,
         src: fa.rec.src || 'none',
         conf: typeof fa.rec.conf === 'number'
@@ -2023,6 +2325,21 @@ async function route(event) {
 
     if (qp.poll === '1') {
       return pollOut(await getState());
+    }
+
+    if (qp.ready === '1') {
+      return {
+        code: 200,
+        body: { status: 'ok', ready: readyFor(await getState()) }
+      };
+    }
+
+    if (qp.ack === '1') {
+      return await handleAck(qp.qid);
+    }
+
+    if (qp.progress === '1') {
+      return await progressOut(qp);
     }
 
     return configOut(await getState());

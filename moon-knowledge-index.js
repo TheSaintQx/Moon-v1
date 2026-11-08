@@ -1,12 +1,25 @@
 'use strict';
 
-// Moon Knowledge Engine v0.5.3
+// Moon Knowledge Engine v0.6.0
 // Standalone Yandex Cloud Function. Node.js 22+, zero npm dependencies.
 // Stores MediaWiki pages and a compact search index in the existing Yandex Object Storage bucket.
+//
+// v0.6.0 — быстрый локальный режим поиска:
+//   (1) search с fast:true не ходит в вики, не переводит запрос в сеть,
+//       не читает лишние страницы и не перезаписывает индекс;
+//   (2) результат быстрого поиска кэшируется в памяти тёплого экземпляра.
+//       Это нужно, чтобы ответ укладывался в реплику Алисы (~4,5 с).
+//   (3) обычный режим (без fast) работает как раньше, без изменений.
 
 const crypto = require('crypto');
 
-const KB_VERSION = '0.5.3';
+const KB_VERSION = '0.6.0';
+
+// Быстрый режим: только локальный индекс, без сети и без записи в S3.
+const FAST_CANDIDATE_LIMIT = 10;
+const SEARCH_CACHE_TTL_MS = 10 * 60 * 1000;
+const SEARCH_CACHE_MAX = 240;
+const SEARCH_CACHE = new Map();
 const TOKEN = process.env.KB_TOKEN || '';
 const BUCKET = process.env.KB_BUCKET || process.env.BUCKET || 'moon-assistant';
 const S3_ID = process.env.ACCESS_KEY_ID || '';
@@ -1299,9 +1312,12 @@ function translationLanguage(manifest) {
     : 'en';
 }
 
-async function translateQueryToLanguage(query, targetLanguage) {
+async function translateQueryToLanguage(query, targetLanguage, opts) {
   const q = String(query || '').trim();
   const target = String(targetLanguage || 'en').toLowerCase();
+  // В быстром режиме перевод берём только из уже сохранённого кэша:
+  // сетевой вызов переводчика не должен задерживать ответ Алисе.
+  const cacheOnly = !!(opts && opts.cacheOnly);
 
   if (!q || !/^[a-z]{2,3}(?:-[a-z0-9]{2,8})?$/.test(target)) {
     return null;
@@ -1333,6 +1349,8 @@ async function translateQueryToLanguage(query, targetLanguage) {
   } catch {
     // Необязательный кэш перевода.
   }
+
+  if (cacheOnly) return null;
 
   try {
     const u = new URL('https://translate.googleapis.com/translate_a/t');
@@ -1394,7 +1412,7 @@ async function translateQueryToLanguage(query, targetLanguage) {
   }
 }
 
-async function buildQueryVariants(gameId, query, manifest) {
+async function buildQueryVariants(gameId, query, manifest, opts) {
   let aliasFile = null;
 
   try {
@@ -1413,7 +1431,7 @@ async function buildQueryVariants(gameId, query, manifest) {
   const target = translationLanguage(manifest);
 
   for (const candidate of out.slice(0, 2)) {
-    const translated = await translateQueryToLanguage(candidate, target);
+    const translated = await translateQueryToLanguage(candidate, target, opts);
 
     if (translated &&
         !out.some(x => normalize(x) === normalize(translated))) {
@@ -1733,12 +1751,47 @@ function bestEvidenceChunk(page,terms,query) {
   };
 }
 
+function searchCacheGet(key) {
+  const hit = SEARCH_CACHE.get(key);
+
+  if (!hit) return null;
+
+  if (Date.now() - hit.at > SEARCH_CACHE_TTL_MS) {
+    SEARCH_CACHE.delete(key);
+    return null;
+  }
+
+  return hit.value;
+}
+
+function searchCacheSet(key, value) {
+  if (SEARCH_CACHE.size >= SEARCH_CACHE_MAX) {
+    const oldest = SEARCH_CACHE.keys().next();
+    if (!oldest.done) SEARCH_CACHE.delete(oldest.value);
+  }
+
+  SEARCH_CACHE.set(key, { at: Date.now(), value });
+}
+
 async function searchGame(body) {
   const id = slug(body.gameId || body.game || '');
   const q = String(body.query || body.q || '').trim().slice(0, MAX_QUERY);
+  // fast: только локальный индекс. Нужен для короткого ответа в реплику Алисы.
+  const fast = body.fast === true || body.fast === 1 ||
+    body.fast === '1' || body.fast === 'true';
+  const cacheKey = id + '|' + (fast ? 'fast|' : 'full|') + normalize(q);
 
   if (!q) {
     throw new Error('query is required');
+  }
+
+  const cached = searchCacheGet(cacheKey);
+
+  if (cached) {
+    return Object.assign({}, cached, {
+      cached: true,
+      search: Object.assign({}, cached.search, { cache: 'warm' })
+    });
   }
 
   let manifest = await readJson(manifestKey(id));
@@ -1780,7 +1833,9 @@ async function searchGame(body) {
     items: []
   };
 
-  const variants = await buildQueryVariants(id, q, manifest);
+  const variants = await buildQueryVariants(id, q, manifest, {
+    cacheOnly: fast
+  });
 
   const terms = Array.from(new Set(
     variants.flatMap(v => searchTokens(v))
@@ -1801,10 +1856,12 @@ async function searchGame(body) {
     /[^\p{Script=Latin}\p{N}\p{P}\p{Z}\p{S}]/u.test(q);
 
   const needsLiveSearch =
-    !ranked.length ||
-    ranked[0].score < 15 ||
-    hasNonLatin ||
-    variants.length > 1;
+    !fast && (
+      !ranked.length ||
+      ranked[0].score < 15 ||
+      hasNonLatin ||
+      variants.length > 1
+    );
 
   let liveSearch = {
     added: 0,
@@ -1828,7 +1885,9 @@ async function searchGame(body) {
   }
 
   // Re-rank a wider set so relevant passages near article ends are not missed.
-  const candidateLimit=Math.min(30,Math.max(10,Number(body.candidateLimit||30)));
+  const candidateLimit=fast
+    ? Math.min(FAST_CANDIDATE_LIMIT,Math.max(4,Number(body.candidateLimit||FAST_CANDIDATE_LIMIT)))
+    : Math.min(30,Math.max(10,Number(body.candidateLimit||30)));
   let candidates=ranked.slice(0,candidateLimit);
   const needsContent=[];
 
@@ -1837,7 +1896,7 @@ async function searchGame(body) {
     if(!page||!page.extract)needsContent.push(hit.item.pageId);
   }
 
-  if(needsContent.length){
+  if(needsContent.length&&!fast){
     const extra=await enrichWikiPages(
       id,
       manifest,
@@ -1895,7 +1954,7 @@ async function searchGame(body) {
     evaluated.push(...loaded.filter(Boolean));
   }
 
-  if(indexChanged)await writeJson(indexKey(id),index);
+  if(indexChanged&&!fast)await writeJson(indexKey(id),index);
 
   evaluated.sort((a,b)=>
     b.score-a.score||b.evidenceScore-a.evidenceScore
@@ -1927,7 +1986,7 @@ async function searchGame(body) {
     };
   });
 
-  return {
+  const payload = {
     status: results.length
       ? 'ok'
       : (manifest.complete ? 'no_evidence' : 'indexing'),
@@ -1942,7 +2001,10 @@ async function searchGame(body) {
       note: 'complete means the current initial all-pages scan reached its end; it does not mean every article on the Wiki has been downloaded.'
     },
     search: {
-      mode: needsLiveSearch ? 'local+wiki' : 'local',
+      mode: fast
+        ? 'local-fast'
+        : (needsLiveSearch ? 'local+wiki' : 'local'),
+      fast: fast === true,
       queryVariants: variants,
       fetchedPages: liveSearch.fetched,
       addedPages: liveSearch.added,
@@ -1953,6 +2015,12 @@ async function searchGame(body) {
     },
     results
   };
+
+  // Кэшируем только содержательные ответы: пустой быстрый поиск не должен
+  // блокировать более полный поиск с обращением к вики.
+  if (results.length) searchCacheSet(cacheKey, payload);
+
+  return payload;
 }
 
 async function statusGame(body) {

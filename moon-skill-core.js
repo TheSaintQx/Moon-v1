@@ -2,13 +2,18 @@
 
 const crypto = require('crypto');
 
-// Moon Skill v9.6-a-v3.8-moon-async
+// Moon Skill v9.7-a-v3.8-moon-async
 // Изменения:
 // - асинхронная отправка вопросов через index.js;
 // - ожидание появления задания в Object Storage по CID после HTTP 202;
 // - токен берётся из уже существующей переменной MOON_TOKEN;
 // - восстановление ответа по UID, даже если тестер не передал state;
 // - сохранена универсальная работа со всеми играми.
+// v9.7:
+// - реплика Алисы используется целиком: 3,0 с на вопрос + опрос до конца бюджета;
+// - более частый опрос (120 мс) и дешёвый ?progress=1 как второй шанс забрать ответ;
+// - ожидание больше не сбрасывает задачу преждевременно;
+// - подсказка про оверлей показывается один раз, а не в каждой реплике.
 
 const CLOUD_URL = 'https://functions.yandexcloud.net/d4el6hpg7nh0cui52kd2';
 
@@ -17,15 +22,16 @@ const CLOUD_URL = 'https://functions.yandexcloud.net/d4el6hpg7nh0cui52kd2';
 const TOKEN = String(process.env.MOON_TOKEN || '').trim();
 
 const TURN_BUDGET_MS    = 4300;
-const SAFETY_MS         = 400;
-const ASK_TIMEOUT_MS    = 2200;
-const ANSWER_TIMEOUT_MS = 1200;
-const POLL_STEP_MS      = 250;
+const SAFETY_MS         = 350;
+const ASK_TIMEOUT_MS    = 3000;
+const ANSWER_TIMEOUT_MS = 900;
+const PROGRESS_TIMEOUT_MS = 700;
+const POLL_STEP_MS      = 120;
 // После HTTP 202 асинхронная функция может ещё не успеть записать CID в хранилище.
 const ASYNC_CREATE_GRACE_MS = 60000;
 const FOLLOWUP_TTL_MS   = 120000;
 const FOLLOWUP_CEIL_MS  = 300000;
-const VER               = '9.6-a-v3.8-moon-async';
+const VER               = '9.7-a-v3.8-moon-async';
 const VOICE_MAX         = 400;
 
 function isTokenConfigured() {
@@ -239,6 +245,17 @@ async function answer(qid, cid, timeoutMs, uid) {
     Math.max(150, Math.min(ANSWER_TIMEOUT_MS, timeoutMs || ANSWER_TIMEOUT_MS)));
 }
 
+// Лёгкий опрос состояния задачи: не запускает обработку на сервере.
+async function progress(cid, uid, timeoutMs) {
+  const p = '?token=' + encodeURIComponent(TOKEN) + '&progress=1' +
+    (cid ? '&cid=' + encodeURIComponent(cid) : '') +
+    (uid ? '&uid=' + encodeURIComponent(uid) : '');
+  const r = await cloudFetch(p, { method: 'GET' },
+    timeoutMs || PROGRESS_TIMEOUT_MS);
+  return (r.kind === 'ok' && r.body && typeof r.body === 'object')
+    ? r.body : null;
+}
+
 async function setGame(game, supersede, timeoutMs, uid) {
   const payload = { game: String(game).slice(0, 60) };
   if (uid) payload.uid = uid;
@@ -283,6 +300,18 @@ function pluralSec(n) {
   if (a > 10 && a < 20) return 'секунд';
   if (b >= 2 && b <= 4) return 'секунды';
   return n === 1 ? 'секунда' : 'секунд';
+}
+
+// Ожидание: сначала честно показываем прогресс, а подсказку про оверлей — один раз.
+function pendingText(s, elapsed) {
+  const sec = Math.max(0, Math.round(Number(elapsed) || 0));
+  const tail = s.hintShown
+    ? 'Скажи «ну что там» ещё раз.'
+    : 'Когда ответ будет готов, он появится в оверлее. Или скажи «ну что там».';
+  s.hintShown = true;
+  return (sec >= 3
+    ? 'Ещё собираю ответ, прошло ' + sec + ' ' + pluralSec(sec) + '. '
+    : 'Собираю ответ. ') + tail;
 }
 
 // При async 202 запись задания может появиться в Object Storage не мгновенно.
@@ -405,7 +434,8 @@ module.exports.handler = async function (event) {
     followUpMax: user.followUpMax || 0,
     followUpFrom: user.followUpFrom || 0,
     asyncAcceptedAt: user.asyncAcceptedAt || 0,
-    awaitingGame: user.awaitingGame === true
+    awaitingGame: user.awaitingGame === true,
+    hintShown: user.hintShown === true
   };
 
   if (mergedGameQuestion && mergedGameQuestion.game) uState.game = mergedGameQuestion.game;
@@ -503,6 +533,26 @@ module.exports.handler = async function (event) {
       clearPending(uState);
       return reply(got.text, false, got.clarify ? 'clarify' : 'done', got.meta);
     }
+
+    // Второй шанс: ?progress=1 читает состояние задачи и не запускает обработку.
+    // Он ловит ответ, который появился между опросами, и честно показывает прогресс.
+    if (!(got && (got.error === 'config' || got.error === 'auth'))) {
+      const pr = await progress(uState.cid, uid,
+        Math.min(PROGRESS_TIMEOUT_MS, turnDeadline - Date.now() - 80));
+
+      if (pr && pr.status === 'done' && pr.text) {
+        const clar = pr.result_status === 'clarify';
+        route(clar ? 'followup-clarify' : 'followup-done');
+        clearPending(uState);
+        return reply(pr.text, false, clar ? 'clarify' : 'done', pr);
+      }
+
+      if (pr && (pr.status === 'processing' || pr.status === 'pending')) {
+        route('followup-waiting'); slideFollowUp(uState);
+        return reply(pendingText(uState, pr.elapsed_s), false, 'pending');
+      }
+    }
+
     if (got && got.expired) {
       route('followup-expired'); clearPending(uState);
       return reply('Срок хранения этого ответа истёк. Задай вопрос ещё раз.', false, 'expired');
@@ -525,7 +575,7 @@ module.exports.handler = async function (event) {
     }
 
     route('followup-pending'); slideFollowUp(uState);
-    return reply('Сервер ещё обрабатывает вопрос. Скажи «ну что там» через несколько секунд.', false, 'pending');
+    return reply(pendingText(uState, 0), false, 'pending');
   };
 
   if (isFollowUp(activeUtter)) return await doFollowUp();
@@ -619,7 +669,7 @@ module.exports.handler = async function (event) {
     }
 
     route('poll-filler'); slideFollowUp(uState);
-    return reply('Собираю ответ. Через несколько секунд скажи «ну что там».', false, 'pending');
+    return reply(pendingText(uState, 0), false, 'pending');
   }
 
   if (r.kind === 'config') {
@@ -644,11 +694,11 @@ module.exports.handler = async function (event) {
   }
   if (r.kind === 'timeout') {
     route('ask-timeout-filler'); slideFollowUp(uState);
-    return reply('Запрос передан серверу. Скажи «ну что там» через несколько секунд.', false, 'pending');
+    return reply(pendingText(uState, 0), false, 'pending');
   }
   if (r.kind === 'ok') {
     route('ask-protocol'); slideFollowUp(uState);
-    return reply('Сервер принял запрос. Скажи «ну что там» через несколько секунд.', false, 'protocol');
+    return reply(pendingText(uState, 0), false, 'protocol');
   }
 
   route('ask-network');
