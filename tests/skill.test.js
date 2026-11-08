@@ -12,6 +12,7 @@ const server = {
   ask: { status: 'query', qid: 123, cid: 'c-1', async: true },
   answer: { status: 'query' },
   progress: null,
+  warm: null,
   calls: []
 };
 
@@ -21,7 +22,7 @@ globalThis.fetch = async function (input, init) {
   const method = String(options.method || 'GET').toUpperCase();
   const qp = url.searchParams;
   const entry = method + ' ' +
-    ['answer', 'progress', 'usergame'].filter(k => qp.get(k))
+    ['answer', 'progress', 'usergame', 'warm'].filter(k => qp.get(k))
       .map(k => k + '=' + qp.get(k)).join(',');
 
   server.calls.push(entry || method);
@@ -33,6 +34,10 @@ globalThis.fetch = async function (input, init) {
 
   if (method === 'POST') return json(server.ask);
   if (qp.get('usergame') === '1') return json({ status: 'ok', game: '' });
+
+  if (qp.get('warm') === '1') {
+    return json(server.warm || { status: 'ok' });
+  }
 
   if (qp.get('answer') === '1') {
     return json(server.answer);
@@ -152,6 +157,26 @@ async function main() {
   const viaProgress = await say('ну что там');
   check('progress: ответ вместо ожидания',
     /сражение 2023/.test(viaProgress), viaProgress);
+
+  // 6. Смена игры прогревает базу по новой игре.
+  server.warm = {
+    status: 'ok',
+    game: 'Minecraft',
+    warm: { status: 'ok', pages: 8, cached: false }
+  };
+  server.calls = [];
+
+  const askGame = await say('сменить игру');
+  check('смена игры: спрашивает название',
+    /какую игру/i.test(askGame), askGame);
+
+  const setGame = await say('майнкрафт');
+  check('смена игры: приняла название',
+    /майнкрафт/i.test(setGame), setGame);
+  check('смена игры: прогрела базу знаний',
+    /8/.test(setGame), setGame);
+  check('смена игры: запрос прогрева отправлен',
+    server.calls.some(c => /warm=1/.test(c)), server.calls.join(' | '));
 
   const failed = results.filter(r => !r.ok);
 

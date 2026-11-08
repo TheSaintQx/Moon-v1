@@ -14,6 +14,9 @@ const crypto = require('crypto');
 // - более частый опрос (120 мс) и дешёвый ?progress=1 как второй шанс забрать ответ;
 // - ожидание больше не сбрасывает задачу преждевременно;
 // - подсказка про оверлей показывается один раз, а не в каждой реплике.
+// v9.8:
+// - после выбора игры сразу прогревается база знаний этой игры (?warm=1);
+// - любая игра работает одинаково: вика ищется по названию, база создаётся сама.
 
 const CLOUD_URL = 'https://functions.yandexcloud.net/d4el6hpg7nh0cui52kd2';
 
@@ -31,7 +34,7 @@ const POLL_STEP_MS      = 120;
 const ASYNC_CREATE_GRACE_MS = 60000;
 const FOLLOWUP_TTL_MS   = 120000;
 const FOLLOWUP_CEIL_MS  = 300000;
-const VER               = '9.7-a-v3.8-moon-async';
+const VER               = '9.8-a-v3.9-moon-async';
 const VOICE_MAX         = 400;
 
 function isTokenConfigured() {
@@ -267,6 +270,34 @@ async function setGame(game, supersede, timeoutMs, uid) {
   }, Math.max(150, Math.min(1200, timeoutMs || 1200)));
 }
 
+// Прогрев базы знаний по выбранной игре: обзорные статьи (персонажи, локации,
+// механики) грузятся сразу, чтобы первые вопросы отвечались без вики.
+// В реплике Алисы держим короткий срок; сама загрузка идёт на стороне vision.
+async function warm(game, timeoutMs, uid) {
+  const p = '?token=' + encodeURIComponent(TOKEN) + '&warm=1&game=' +
+    encodeURIComponent(String(game || '').slice(0, 60)) +
+    (uid ? '&uid=' + encodeURIComponent(uid) : '');
+  const r = await cloudFetch(p, { method: 'GET' }, Math.max(200, timeoutMs));
+  return (r.kind === 'ok' && r.body && typeof r.body === 'object')
+    ? r.body : null;
+}
+
+function warmTail(w) {
+  if (w && w.status === 'ok') {
+    const pages = Number(w.warm && w.warm.pages) || 0;
+
+    return pages
+      ? ' Статьи по ней уже загружены: ' + pages + '.'
+      : ' Статьи по ней подгружаются.';
+  }
+
+  if (w && (w.status === 'no_evidence' || w.status === 'needs_wiki')) {
+    return ' Готовых статей по ней не нашлось — спроси, и я поищу в вики.';
+  }
+
+  return ' Статьи по ней догружаются, первые вопросы могут подождать.';
+}
+
 async function fetchUserGame(uid, timeoutMs) {
   if (!uid) return '';
   const r = await cloudFetch(
@@ -478,7 +509,7 @@ module.exports.handler = async function (event) {
   if (isHelp(activeUtter)) {
     route('help');
     return reply(
-      'Скажи, во что играешь, и задавай вопросы. «Покажи воина» — обведу объект на экране. «Ну что там» — забрать ответ, если я сказал «собираю». Чтобы сменить игру, скажи «Сменить игру».',
+      'Скажи, во что играешь, и спрашивай что угодно: кто главные герои, что это за локация, что лучше из двух вещей. «Покажи воина» — обведу объект на экране. «Ну что там» — забрать ответ. Чтобы сменить игру, скажи «Сменить игру».',
       false, 'ok'
     );
   }
@@ -500,7 +531,11 @@ module.exports.handler = async function (event) {
     clearPending(uState); uState.awaitingGame = false; uState.game = candidate;
     const sg = await setGame(candidate, oldCid, turnDeadline - Date.now() - SAFETY_MS, uid);
 
-    if (sg.status === 200) return reply('Принято, теперь игра: ' + candidate + '. Спрашивай!', false, 'ok');
+    if (sg.status === 200) {
+      const w = await warm(candidate,
+        Math.min(1800, turnDeadline - Date.now() - SAFETY_MS), uid);
+      return reply('Принято, теперь игра: ' + candidate + '.' + warmTail(w), false, 'ok');
+    }
     if (sg.kind === 'config') return reply('Запомнила игру «' + candidate + '» в навыке, но MOON_TOKEN не настроен. Проверь переменную MOON_TOKEN в настройках moon-skill.', false, 'config');
     if (sg.status === 403) return reply('Запомнила игру «' + candidate + '» в навыке, но сервер отклонил токен. Проверь MOON_TOKEN и AUTH_TOKEN.', false, 'auth-error');
     return reply('Записала у себя новую игру: ' + candidate + '. Но сервер не подтвердил сохранение. Если что-то пойдёт не так, назови игру ещё раз.', false, 'degraded');
@@ -605,7 +640,11 @@ module.exports.handler = async function (event) {
       clearPending(uState); uState.game = g;
       const sg = await setGame(g, oldCid, turnDeadline - Date.now() - SAFETY_MS, uid);
 
-      if (sg.status === 200) return reply('Принято, игра: ' + g + '. Спрашивай!', false, 'ok');
+      if (sg.status === 200) {
+        const w = await warm(g,
+          Math.min(1800, turnDeadline - Date.now() - SAFETY_MS), uid);
+        return reply('Принято, игра: ' + g + '.' + warmTail(w), false, 'ok');
+      }
       if (sg.kind === 'config') return reply('Запомнила игру «' + g + '» в навыке, но MOON_TOKEN не настроен. Проверь переменную MOON_TOKEN в настройках moon-skill.', false, 'config');
       if (sg.status === 403) return reply('Запомнила игру «' + g + '» в навыке, но сервер отклонил запрос. Проверь MOON_TOKEN и AUTH_TOKEN.', false, 'auth-error');
       return reply('Записала у себя: ' + g + '. Но бэкенд не подтвердил сохранение — если что-то пойдёт не так, назови игру ещё раз.', false, 'degraded');
@@ -716,5 +755,7 @@ module.exports._test = {
   isChangeGame,
   cleanGameCandidate,
   isTokenConfigured,
-  pollAnswer
+  pollAnswer,
+  warm,
+  warmTail
 };

@@ -26,11 +26,29 @@ const GAME = 'Cyberpunk 2077';
 const Q = 'когда основан найт сити';
 
 // --- подмена базы знаний и модели ---
-const kbState = { mode: 'empty', log: [] };
-const modelState = { mode: 'ok' };
+const kbState = { mode: 'empty', log: [], intent: null, comparison: null };
+const modelState = { mode: 'ok', lastUser: '' };
 
 s3.mount('kb.test', async function (url, init) {
   const body = JSON.parse(String(init.body || '{}'));
+
+  if (body.action === 'warm') {
+    kbState.log.push('warm');
+
+    return {
+      status: 200,
+      body: {
+        status: 'ok',
+        gameId: 'cyberpunk-2077',
+        game: 'Cyberpunk 2077',
+        cached: false,
+        pages: 6,
+        pageCount: 120,
+        sections: { main: [9], characters: [1, 2, 3], locations: [4] }
+      }
+    };
+  }
+
   const fast = body.fast === true;
 
   kbState.log.push(fast ? 'fast' : 'full');
@@ -44,18 +62,24 @@ s3.mount('kb.test', async function (url, init) {
 
   return {
     status: 200,
-    body: {
+    body: Object.assign({
       status: 'ok',
       game: 'Cyberpunk 2077',
       results: [{
         title: 'Найт-Сити',
         evidence: 'Найт-Сити был основан в мае 1994 года.'
       }]
-    }
+    }, kbState.intent ? { intent: kbState.intent } : {},
+    kbState.comparison ? { comparison: kbState.comparison } : {})
   };
 });
 
-s3.mount('ai.api.cloud.yandex.net', async function () {
+s3.mount('ai.api.cloud.yandex.net', async function (url, init) {
+  const sent = JSON.parse(String(init.body || '{}'));
+
+  modelState.lastUser = String(
+    (sent.messages && sent.messages[1] && sent.messages[1].content) || ''
+  );
   const answer = modelState.mode === 'ok'
     ? {
         speech: 'Найт-Сити основан в мае 1994 года.',
@@ -266,6 +290,67 @@ async function main() {
 
   check('пустой быстрый поиск: полный выполнен',
     kbState.log.join(',') === 'fast,full', kbState.log.join(','));
+
+  // --- 9. прогрев базы при выборе игры ---
+  s3.reset();
+  s3.put('state.json', blank());
+  kbState.log = [];
+
+  const warm = await call({ warm: '1', game: GAME, uid: UID });
+
+  check('прогрев: статус ok', warm.body.status === 'ok',
+    JSON.stringify(warm.body).slice(0, 120));
+  check('прогрев: вызов дошел до базы', kbState.log.join(',') === 'warm',
+    kbState.log.join(','));
+  check('прогрев: количество статей',
+    warm.body.warm && warm.body.warm.pages === 6,
+    JSON.stringify(warm.body.warm));
+  check('прогрев: разбивка по разделам',
+    warm.body.warm && warm.body.warm.sections &&
+    warm.body.warm.sections.characters === 3,
+    JSON.stringify(warm.body.warm && warm.body.warm.sections));
+
+  const savedWarm = (s3.get('state.json') || {}).warm;
+  check('прогрев: итог записан в состояние',
+    savedWarm && savedWarm.game === GAME && savedWarm.pages === 6,
+    JSON.stringify(savedWarm));
+
+  const cfgWarm = await call({ config: '1' });
+  check('прогрев: виден в ответе config',
+    cfgWarm.body.warm && cfgWarm.body.warm.game === GAME,
+    JSON.stringify(cfgWarm.body.warm));
+
+  // --- 10. намерение вопроса уходит в модель ---
+  s3.reset();
+  s3.put('state.json', blank());
+  kbState.mode = 'hit';
+  modelState.mode = 'ok';
+  kbState.log = [];
+  kbState.intent = { name: 'characters', section: 'characters' };
+  modelState.lastUser = '';
+
+  await post({
+    q: 'кто главные герои игры', game: GAME, cid: 'c-intent-1', uid: UID
+  });
+
+  check('намерение: подсказка о персонажах в запросе к модели',
+    /персонаж/i.test(modelState.lastUser),
+    modelState.lastUser.slice(0, 140));
+
+  kbState.intent = { name: 'compare', section: '' };
+  kbState.comparison = { entities: ['Джонни', 'Джеки'] };
+  modelState.lastUser = '';
+
+  await post({
+    q: 'кто лучше джонни или джеки', game: GAME, cid: 'c-intent-2', uid: UID
+  });
+
+  check('намерение: сравнение доходит до модели',
+    /Джонни/.test(modelState.lastUser) && /Джеки/.test(modelState.lastUser),
+    modelState.lastUser.slice(0, 160));
+
+  kbState.intent = null;
+  kbState.comparison = null;
 
   const failed = results.filter(r => !r.ok);
 

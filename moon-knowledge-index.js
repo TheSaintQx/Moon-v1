@@ -1,6 +1,6 @@
 'use strict';
 
-// Moon Knowledge Engine v0.6.0
+// Moon Knowledge Engine v0.7.0
 // Standalone Yandex Cloud Function. Node.js 22+, zero npm dependencies.
 // Stores MediaWiki pages and a compact search index in the existing Yandex Object Storage bucket.
 //
@@ -10,10 +10,20 @@
 //   (2) результат быстрого поиска кэшируется в памяти тёплого экземпляра.
 //       Это нужно, чтобы ответ укладывался в реплику Алисы (~4,5 с).
 //   (3) обычный режим (без fast) работает как раньше, без изменений.
+//
+// v0.7.0 — универсальная база и вопросы «по смыслу»:
+//   (1) action:warm — по названию любой игры находит вики, регистрирует и
+//       подтягивает обзорные статьи (персонажи, локации, механики, сюжет),
+//       чтобы база была тёплой к началу игры;
+//   (2) вопрос получает намерение (characters/locations/items/mechanics/story)
+//       и обзорная статья подмешивается к выдаче даже без совпадения слов;
+//   (3) «что лучше: X или Y» разбирается на две сущности и обе ищутся отдельно;
+//   (4) пустой локальный ответ больше не заставляет ходить в вики на каждый
+//       русский вопрос: эскалация только при слабой выдаче.
 
 const crypto = require('crypto');
 
-const KB_VERSION = '0.6.0';
+const KB_VERSION = '0.7.0';
 
 // Быстрый режим: только локальный индекс, без сети и без записи в S3.
 const FAST_CANDIDATE_LIMIT = 10;
@@ -31,12 +41,23 @@ const MAX_BATCH = Math.min(50, Math.max(1, Number(process.env.KB_BATCH_SIZE || 2
 const MAX_PAGES = Math.min(50000, Math.max(100, Number(process.env.KB_MAX_PAGES || 12000)));
 const MAX_QUERY = 240;
 const ON_DEMAND_SEARCH_LIMIT = 5;
-const MAX_QUERY_VARIANTS = 4;
+const MAX_QUERY_VARIANTS = 6;
+// Тёплая база: обзорные статьи по игре и бюджет на их загрузку.
+const WARM_PAGES_PER_QUERY = 3;
+const WARM_FORCED_PAGES = 3;
+const WARM_BUDGET_MS = Math.min(
+  90000,
+  Math.max(5000, Number(process.env.KB_WARM_BUDGET_MS || 35000))
+);
+const KB_WARM_TTL_MS = Math.max(
+  60 * 1000,
+  Number(process.env.KB_WARM_TTL_MS || 12 * 3600 * 1000)
+);
 const MAX_PAGE_TEXT = Math.min(50000, Math.max(5000, Number(process.env.KB_MAX_PAGE_TEXT || 30000)));
 const MAX_ENRICH_PAGES = Math.min(8, Math.max(1, Number(process.env.KB_MAX_ENRICH_PAGES || 5)));
 const MAX_PARSE_FALLBACK_PAGES = 2;
 
-const UA = 'MoonKnowledgeEngine/0.5.3 (universal multilingual game knowledge; contact: configure KB_CONTACT)';
+const UA = 'MoonKnowledgeEngine/0.7.0 (universal multilingual game knowledge; contact: configure KB_CONTACT)';
 const TRANSLATION_TIMEOUT_MS = Math.min(9000, Math.max(2000, Number(process.env.KB_TRANSLATION_TIMEOUT_MS || 5500)));
 const DISCOVERY_TIMEOUT_MS = Number(process.env.KB_DISCOVERY_TIMEOUT_MS || 9000);
 const DISCOVERY_MAX_CANDIDATES = 6;
@@ -144,6 +165,148 @@ function queryHintTerms(query) {
   }
 
   return hints;
+}
+
+// ---------- намерение вопроса ----------
+// «Кто главные герои», «что это за локация», «что лучше: X или Y» нельзя
+// обслужить совпадением слов: ответ часто лежит в обзорной статье
+// («Персонажи», «Локации»), где слов вопроса может не быть вовсе.
+// Намерение расширяет запрос обзорными терминами и подтягивает такие статьи,
+// а модель уже смешивает сведения из нескольких источников в один ответ.
+
+const INTENT_RULES = [
+  {
+    name: 'characters',
+    section: 'characters',
+    re: /(главн[\p{L}]*\s+геро|геро[\p{L}]*|персонаж[\p{L}]*|протагонист[\p{L}]*|антагонист[\p{L}]*|злоде[\p{L}]*|босс[\p{L}]*|кто\s+(?:это|он|она|они|такой|такая|такие)|второстепенн[\p{L}]*|\bnpc\b|\bcharacter|\bprotagonis|\bantagonis|\bvillain|\bcast\b)/u,
+    title: /(персонаж|геро|character|protagonis|antagonis|\bcast\b|список)/iu,
+    queries: {
+      ru: ['персонажи', 'главный герой'],
+      en: ['characters', 'main characters']
+    }
+  },
+  {
+    name: 'locations',
+    section: 'locations',
+    re: /(локаци[\p{L}]*|местност[\p{L}]*|мир[аеу]?|карт[аеуы]|регион[\p{L}]*|зон[аыуе]|город[\p{L}]*|планет[\p{L}]*|\blocation|\bregion\b|\bworld\b|\bmap\b|\barea\b)/u,
+    title: /(локаци|местност|\blocation|\bregion\b|\bworld\b|\bmap\b|\barea\b)/iu,
+    queries: {
+      ru: ['локации', 'мир игры'],
+      en: ['locations', 'world']
+    }
+  },
+  {
+    name: 'items',
+    section: 'items',
+    re: /(предмет[\p{L}]*|оружи[\p{L}]*|брон[\p{L}]*|экипиров[\p{L}]*|артефакт[\p{L}]*|зель[\p{L}]*|ресурс[\p{L}]*|\bitem|\bweapon|\barmou?r|\bequipment|\bartifact)/u,
+    title: /(предмет|оружи|экипиров|\bitem|\bweapon|\barmou?r|\bequipment)/iu,
+    queries: {
+      ru: ['предметы', 'оружие'],
+      en: ['items', 'weapons']
+    }
+  },
+  {
+    name: 'mechanics',
+    section: 'mechanics',
+    re: /(механик[\p{L}]*|систем[\p{L}]*|прокачк[\p{L}]*|уровн[\p{L}]*|умени[\p{L}]*|навык[\p{L}]*|класс[\p{L}]*|крафт[\p{L}]*|\bmechanic|\bsystem\b|\blevel|\bskill|\bclass\b|\bcraft)/u,
+    title: /(механик|систем|прокачк|\bmechanic|\bsystem\b|\bgameplay)/iu,
+    queries: {
+      ru: ['игровой процесс', 'механики'],
+      en: ['gameplay', 'mechanics']
+    }
+  },
+  {
+    name: 'story',
+    section: 'story',
+    re: /(сюжет[\p{L}]*|истори[\p{L}]*|финал[\p{L}]*|концовк[\p{L}]*|\bplot\b|\bstory\b|\bending)/u,
+    title: /(сюжет|истори|\bplot\b|\bstory\b)/iu,
+    queries: {
+      ru: ['сюжет', 'концовки'],
+      en: ['plot', 'endings']
+    }
+  }
+];
+
+function detectIntent(query) {
+  const q = normalize(query);
+
+  if (!q) return { name: 'general', section: '', title: null };
+
+  for (const rule of INTENT_RULES) {
+    if (rule.re.test(q)) {
+      return { name: rule.name, section: rule.section, title: rule.title };
+    }
+  }
+
+  return { name: 'general', section: '', title: null };
+}
+
+function intentQueryTerms(name, language) {
+  const rule = INTENT_RULES.find(r => r.name === name);
+
+  if (!rule) return [];
+
+  const lang = String(language || 'en').toLowerCase().slice(0, 2);
+  const list = rule.queries[lang] || rule.queries.en || [];
+
+  return list.slice(0, 2);
+}
+
+// Что загрузить в тёплую базу: сама игра плюс по одному обзорному запросу
+// на каждое намерение. Названия запросов — на языке вики.
+function warmPlan(game, language) {
+  const lang = String(language || 'en').toLowerCase().slice(0, 2);
+  const plan = [
+    { section: 'main', query: String(game || '').slice(0, 100) }
+  ];
+
+  for (const rule of INTENT_RULES) {
+    const terms = rule.queries[lang] || rule.queries.en || [];
+    if (terms.length) plan.push({ section: rule.section, query: terms[0] });
+  }
+
+  return plan.filter(step => step.query);
+}
+
+// ---------- сравнение двух объектов ----------
+
+const COMPARE_MARK_RE = /(лучше|хуже|сильнее|слабее|полезнее|выгоднее|сравн|выбрать|выбери|что\s+взять|что\s+брать|что\s+качать|стоит\s+ли|предпочт)/iu;
+const COMPARE_SPLIT_RE = /\s+(?:или|либо|vs\.?|против)\s+/iu;
+const COMPARE_LEAD_RE = /^(?:а|и|но|ну)\s+/iu;
+const COMPARE_WORD_RE = /^(?:что|кто|какой|какая|какое|какие|чем|лучше|хуже|сильнее|слабее|полезнее|выгоднее|сравни|сравните|выбрать|выбери|посоветуй|подскажи|стоит\s+(?:ли\s+)?(?:брать|взять|качать))\s+/iu;
+
+function cleanCompareSide(value) {
+  let s = String(value || '').replace(/\s+/g, ' ').trim();
+  let prev;
+
+  do {
+    prev = s;
+    s = s.replace(COMPARE_LEAD_RE, '').replace(COMPARE_WORD_RE, '').trim();
+  } while (s !== prev);
+
+  return s
+    .replace(/^[\s—–:,\-]+/u, '')
+    .replace(/[?!.,;:]+$/u, '')
+    .trim();
+}
+
+// «что лучше — меч или топор» -> {entities:['меч','топор']}.
+// Обычный «где найти меч или топор» не является сравнением: нужен маркер выбора.
+function splitComparison(query) {
+  const raw = String(query || '').replace(/\s+/g, ' ').trim();
+
+  if (raw.length < 6 || !COMPARE_MARK_RE.test(raw)) return null;
+
+  const parts = raw.split(COMPARE_SPLIT_RE);
+
+  if (parts.length !== 2) return null;
+
+  const entities = parts.map(cleanCompareSide);
+
+  if (entities.some(e => e.length < 2 || e.length > 60)) return null;
+  if (normalize(entities[0]) === normalize(entities[1])) return null;
+
+  return { raw: raw, entities: entities };
 }
 
 function slug(s) {
@@ -273,6 +436,11 @@ function aliasesKey(id) {
 
 function pageKey(id, pageId) {
   return gameRoot(id) + '/pages/' + String(pageId) + '.json';
+}
+
+// Обзорные статьи игры: какие страницы относятся к персонажам, локациям и т.д.
+function warmKey(id) {
+  return gameRoot(id) + '/warm.json';
 }
 
 function allowedWikiHost(host) {
@@ -996,6 +1164,12 @@ function revisionContent(p) {
 }
 
 function makePageRecord(p, manifest) {
+  // Не все источники отдают server: без него ссылка всё равно должна быть
+  // рабочей, поэтому берём корень из api.php.
+  const source = (manifest && manifest.source) || {};
+  const serverBase = String(source.server || source.api || '')
+    .replace(/\/[^/]*api\.php.*$/i, '')
+    .replace(/\/$/, '');
   const extractText = stripHtml(p.extract || '');
   const rawRevision = revisionContent(p);
   const revisionText = rawRevision ? stripWikitext(rawRevision) : '';
@@ -1024,7 +1198,7 @@ function makePageRecord(p, manifest) {
     url: String(
       p.fullurl ||
       (
-        manifest.source.server.replace(/\/$/, '') +
+        serverBase +
         '/wiki/' +
         encodeURIComponent(p.title.replace(/ /g, '_'))
       )
@@ -1504,8 +1678,9 @@ async function searchWikiOnDemand(id, manifest, index, variants) {
   const errors = [];
   const fetchedIds = [];
 
-  // Обычно это исходный запрос и один перевод.
-  for (const query of variants.slice(0, 2)) {
+  // Обычно это исходный запрос, обзорный термин намерения или перевод,
+  // а при сравнении — ещё и вторая из двух сущностей.
+  for (const query of variants.slice(0, 3)) {
     try {
       const data = await wikiGet(manifest.source.api, {
         action: 'query',
@@ -1672,7 +1847,168 @@ async function syncGame(body) {
   };
 }
 
-function scoreItem(item,terms){
+// Тёплая база: по названию игры находит вики и тянет обзорные статьи,
+// чтобы первые вопросы по только что выбранной игре отвечались локально.
+// Повторный вызов в течение KB_WARM_TTL_MS отдаётся из сохранённого итога,
+// если не передан refresh:true.
+async function warmGame(body) {
+  const started = Date.now();
+  const input = body || {};
+  const id = slug(input.gameId || input.game || '');
+
+  if (id === 'unknown-game') {
+    throw new Error('gameId or game is required');
+  }
+
+  const refresh = input.refresh === true || input.refresh === 1 ||
+    input.refresh === '1' || input.refresh === 'true';
+
+  let manifest = await readJson(manifestKey(id));
+
+  if (!manifest) {
+    try {
+      await registerGame({
+        game: input.game || input.gameId,
+        gameId: id,
+        wikiApi: input.wikiApi || ''
+      });
+    } catch (e) {
+      return {
+        status: 'needs_wiki',
+        gameId: id,
+        message: String(
+          e && e.message || 'Wiki source is not configured'
+        ).slice(0, 240)
+      };
+    }
+
+    manifest = await readJson(manifestKey(id));
+  }
+
+  if (!manifest) {
+    return { status: 'needs_wiki', gameId: id };
+  }
+
+  const cached = await readJson(warmKey(id)).catch(() => null);
+  const cachedAge = cached && cached.builtAt
+    ? Date.now() - Date.parse(cached.builtAt)
+    : Infinity;
+
+  if (!refresh && cached && cachedAge < KB_WARM_TTL_MS &&
+      Array.isArray(cached.pageIds) && cached.pageIds.length) {
+    return {
+      status: 'ok',
+      gameId: id,
+      game: manifest.game,
+      cached: true,
+      builtAt: cached.builtAt,
+      pages: cached.pageIds.length,
+      pageCount: manifest.pageCount || 0,
+      sections: cached.sections || {},
+      ageS: Math.round(cachedAge / 1000)
+    };
+  }
+
+  const language = translationLanguage(manifest);
+  const index = await readJson(indexKey(id)) || {
+    schemaVersion: 1,
+    items: []
+  };
+  const sections = {};
+  const errors = [];
+  let fetched = 0;
+  let added = 0;
+  let truncated = false;
+
+  for (const step of warmPlan(manifest.game || input.game, language)) {
+    const left = WARM_BUDGET_MS - (Date.now() - started);
+
+    if (left < 3000) {
+      truncated = true;
+      break;
+    }
+
+    try {
+      const data = await wikiGet(manifest.source.api, {
+        action: 'query',
+        generator: 'search',
+        gsrsearch: step.query,
+        gsrnamespace: 0,
+        gsrwhat: 'text',
+        gsrlimit: WARM_PAGES_PER_QUERY,
+        prop: 'extracts|info|categories',
+        exintro: 0,
+        explaintext: 1,
+        exsectionformat: 'plain',
+        exchars: MAX_PAGE_TEXT,
+        inprop: 'url',
+        cllimit: 20,
+        format: 'json',
+        formatversion: 2
+      }, Math.min(FETCH_TIMEOUT_MS, Math.max(3000, left - 1500)));
+
+      const pages = wikiPages(data)
+        .filter(p => p && p.pageid !== undefined && p.title);
+
+      fetched += pages.length;
+      added += await storeWikiPages(id, manifest, index, pages);
+
+      const list = sections[step.section] || (sections[step.section] = []);
+
+      for (const p of pages) {
+        const pageId = Number(p.pageid);
+        if (!list.includes(pageId)) list.push(pageId);
+      }
+    } catch (e) {
+      errors.push(
+        step.section + ': ' + String(e && e.message || e).slice(0, 120)
+      );
+    }
+  }
+
+  const pageIds = Array.from(new Set(
+    Object.values(sections).reduce((acc, list) => acc.concat(list), [])
+  ));
+
+  manifest.pageCount = index.items.length;
+  manifest.updatedAt = new Date().toISOString();
+  manifest.lastWarmAt = manifest.updatedAt;
+
+  await writeJson(indexKey(id), index);
+  await writeJson(manifestKey(id), manifest);
+
+  const warm = {
+    schemaVersion: 1,
+    gameId: id,
+    game: manifest.game,
+    language: language,
+    builtAt: manifest.updatedAt,
+    sections: sections,
+    pageIds: pageIds,
+    errors: errors,
+    truncated: truncated
+  };
+
+  await writeJson(warmKey(id), warm);
+
+  return {
+    status: pageIds.length ? 'ok' : 'no_evidence',
+    gameId: id,
+    game: manifest.game,
+    cached: false,
+    builtAt: warm.builtAt,
+    pages: pageIds.length,
+    pageCount: manifest.pageCount,
+    sections: sections,
+    fetched: fetched,
+    added: added,
+    truncated: truncated,
+    errors: errors,
+    ms: Date.now() - started
+  };
+}
+
+function scoreItem(item,terms,intent){
   const title=new Set(searchTokens(item.title)),lead=new Set(searchTokens(item.lead));
   const tail=new Set(searchTokens(item.tail||'')),tokens=new Set(item.tokens||[]);
   let score=0,matched=0;
@@ -1692,6 +2028,16 @@ function scoreItem(item,terms){
   }
 
   if(terms.length&&matched>=Math.min(2,terms.length))score+=4;
+
+  // Обзорная статья («Персонажи», «Локации») отвечает на вопрос по смыслу,
+  // даже когда слов самого вопроса в ней нет.
+  if (intent && intent.title) {
+    const label = String(item.title || '') + ' ' +
+      (Array.isArray(item.categories) ? item.categories.join(' ') : '');
+
+    if (intent.title.test(label)) score += 22;
+  }
+
   return score;
 }
 
@@ -1773,6 +2119,43 @@ function searchCacheSet(key, value) {
   SEARCH_CACHE.set(key, { at: Date.now(), value });
 }
 
+// При сравнении двух объектов ответ должен содержать выдержки про оба,
+// а не только про тот, который чаще совпал по словам.
+function interleaveByEntity(list, limit) {
+  const groups = {};
+  let tagged = false;
+
+  for (const x of list) {
+    const key = x.entity || '';
+    if (key) tagged = true;
+    (groups[key] = groups[key] || []).push(x);
+  }
+
+  if (!tagged) return list.slice(0, limit);
+
+  const keys = Object.keys(groups);
+  const out = [];
+  let i = 0;
+
+  while (out.length < limit) {
+    let moved = false;
+
+    for (const key of keys) {
+      if (!groups[key][i]) continue;
+
+      out.push(groups[key][i]);
+      moved = true;
+
+      if (out.length >= limit) break;
+    }
+
+    if (!moved) break;
+    i++;
+  }
+
+  return out;
+}
+
 async function searchGame(body) {
   const id = slug(body.gameId || body.game || '');
   const q = String(body.query || body.q || '').trim().slice(0, MAX_QUERY);
@@ -1833,9 +2216,40 @@ async function searchGame(body) {
     items: []
   };
 
-  const variants = await buildQueryVariants(id, q, manifest, {
+  const comparison = splitComparison(q);
+  const intent = comparison
+    ? { name: 'compare', section: '', title: null }
+    : detectIntent(q);
+  const language = translationLanguage(manifest);
+
+  // Порядок запросов: сам вопрос, затем сущности сравнения или обзорные
+  // термины намерения («персонажи», «локации»), затем перевод на язык вики.
+  const baseVariants = await buildQueryVariants(id, q, manifest, {
     cacheOnly: fast
   });
+  const extraVariants = comparison
+    ? comparison.entities
+    : intentQueryTerms(intent.name, language);
+  const variants = [];
+
+  for (const value of [baseVariants[0]].concat(
+    extraVariants,
+    baseVariants.slice(1)
+  )) {
+    const v = String(value || '').trim();
+
+    if (v && !variants.some(x => normalize(x) === normalize(v))) {
+      variants.push(v);
+    }
+
+    if (variants.length >= MAX_QUERY_VARIANTS) break;
+  }
+
+  const warm = await readJson(warmKey(id)).catch(() => null);
+  const warmPages = intent.section && warm && warm.sections &&
+    Array.isArray(warm.sections[intent.section])
+    ? warm.sections[intent.section].map(Number).filter(Number.isFinite)
+    : [];
 
   const terms = Array.from(new Set(
     variants.flatMap(v => searchTokens(v))
@@ -1845,7 +2259,7 @@ async function searchGame(body) {
   const rank = () => (index.items || [])
     .map(x => ({
       item: x,
-      score: scoreItem(x, terms)
+      score: scoreItem(x, terms, intent)
     }))
     .filter(x => x.score > 0)
     .sort((a, b) => b.score - a.score);
@@ -1854,13 +2268,19 @@ async function searchGame(body) {
 
   const hasNonLatin =
     /[^\p{Script=Latin}\p{N}\p{P}\p{Z}\p{S}]/u.test(q);
+  const topScore = ranked.length ? ranked[0].score : 0;
+  const hasIntentOverview = !intent.title || ranked.some(x =>
+    intent.title.test(String(x.item.title || ''))
+  );
 
+  // В вики идём только при слабом локальном ответе или когда обзорной статьи
+  // по намерению ещё нет. Иначе каждый русский вопрос снова тянул бы вики
+  // и снова не укладывался бы в реплику Алисы.
   const needsLiveSearch =
     !fast && (
-      !ranked.length ||
-      ranked[0].score < 15 ||
-      hasNonLatin ||
-      variants.length > 1
+      topScore < 15 ||
+      (hasNonLatin && topScore < 30) ||
+      !!(intent.section && !warmPages.length && !hasIntentOverview)
     );
 
   let liveSearch = {
@@ -1876,7 +2296,7 @@ async function searchGame(body) {
       id,
       manifest,
       index,
-      variants
+      variants.slice(0, comparison ? 3 : 2)
     );
 
     if (liveSearch.fetched || liveSearch.enriched) {
@@ -1889,6 +2309,48 @@ async function searchGame(body) {
     ? Math.min(FAST_CANDIDATE_LIMIT,Math.max(4,Number(body.candidateLimit||FAST_CANDIDATE_LIMIT)))
     : Math.min(30,Math.max(10,Number(body.candidateLimit||30)));
   let candidates=ranked.slice(0,candidateLimit);
+  const forcedIds=new Set();
+  const entitiesOf=new Map();
+
+  // Обзорная статья по намерению («Персонажи», «Локации») и статьи про обе
+  // сущности сравнения попадают в выдачу даже без совпадения слов с вопросом.
+  const pushForced=(item,entity)=>{
+    if(!item||item.pageId===undefined)return;
+    if(forcedIds.has(item.pageId))return;
+    if(candidates.some(c=>c.item.pageId===item.pageId))return;
+
+    candidates.push({item:item,score:0});
+    forcedIds.add(item.pageId);
+    if(entity)entitiesOf.set(item.pageId,entity);
+  };
+
+  for(const pageId of warmPages.slice(0,WARM_FORCED_PAGES)){
+    pushForced((index.items||[]).find(x=>x.pageId===pageId),null);
+  }
+
+  if(comparison){
+    for(const entity of comparison.entities){
+      const entityTerms=searchTokens(entity);
+
+      const top=(index.items||[])
+        .map(x=>({item:x,score:scoreItem(x,entityTerms,null)}))
+        .filter(x=>x.score>0)
+        .sort((a,b)=>b.score-a.score)
+        .slice(0,2);
+
+      for(const hit of top){
+        const at=candidates.findIndex(c=>c.item.pageId===hit.item.pageId);
+
+        if(at>=0){
+          entitiesOf.set(hit.item.pageId,entity);
+          continue;
+        }
+
+        pushForced(hit.item,entity);
+      }
+    }
+  }
+
   const needsContent=[];
 
   for(const hit of candidates){
@@ -1941,13 +2403,16 @@ async function searchGame(body) {
       }
 
       const picked=bestEvidenceChunk(page,terms,q);
+      const forced=forcedIds.has(page.pageId);
 
       return {
         item:refreshed,
         page,
         evidence:String(picked.evidence||'').slice(0,2000),
         evidenceScore:picked.score,
-        score:hit.score+Math.min(90,picked.score*3)
+        score:hit.score+Math.min(90,picked.score*3)+(forced?12:0),
+        forced:forced,
+        entity:entitiesOf.get(page.pageId)||null
       };
     }));
 
@@ -1961,9 +2426,8 @@ async function searchGame(body) {
   );
 
   const requestedLimit=Math.min(8,Math.max(1,Number(body.limit||5)));
-  const selected=evaluated
-    .filter(x=>x.evidenceScore>0)
-    .slice(0,requestedLimit);
+  const usable=evaluated.filter(x=>x.evidenceScore>0||x.forced);
+  const selected=interleaveByEntity(usable,requestedLimit);
 
   const results=selected.map(hit=>{
     const page=hit.page;
@@ -1977,6 +2441,7 @@ async function searchGame(body) {
       categories:page.categories,
       score:hit.score,
       evidenceScore:hit.evidenceScore,
+      entity:hit.entity||null,
       evidence,
       contentAvailable:!!page.extract,
       contentLength:page.contentLength||(page.extract||'').length,
@@ -2000,6 +2465,12 @@ async function searchGame(body) {
       complete: manifest.complete,
       note: 'complete means the current initial all-pages scan reached its end; it does not mean every article on the Wiki has been downloaded.'
     },
+    intent: { name: intent.name, section: intent.section },
+    comparison: comparison ? { entities: comparison.entities } : null,
+    warm: warm ? {
+      builtAt: warm.builtAt || '',
+      pages: (warm.pageIds || []).length
+    } : null,
     search: {
       mode: fast
         ? 'local-fast'
@@ -2046,6 +2517,7 @@ async function statusGame(body) {
     createdAt: m.createdAt,
     updatedAt: m.updatedAt,
     lastSyncAt: m.lastSyncAt,
+    lastWarmAt: m.lastWarmAt || null,
     errors: m.errors || []
   };
 }
@@ -2117,6 +2589,10 @@ async function route(event) {
       return json(200, await searchGame(input));
     }
 
+    if (action === 'warm') {
+      return json(200, await warmGame(input));
+    }
+
     if (action === 'setaliases') {
       return json(200, await setGameAliases(input));
     }
@@ -2150,6 +2626,7 @@ async function route(event) {
         'syncAll',
         'status',
         'search',
+        'warm',
         'setAliases'
       ]
     });
@@ -2187,6 +2664,12 @@ module.exports._test = {
   removeBalancedTemplates,
   makeChunks,
   scoreItem,
+  detectIntent,
+  intentQueryTerms,
+  warmPlan,
+  splitComparison,
+  cleanCompareSide,
+  interleaveByEntity,
   queryVariants,
   translationLanguage,
   translateQueryToLanguage,
