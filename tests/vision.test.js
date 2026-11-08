@@ -27,7 +27,7 @@ const Q = 'когда основан найт сити';
 
 // --- подмена базы знаний и модели ---
 const kbState = { mode: 'empty', log: [], intent: null, comparison: null };
-const modelState = { mode: 'ok', lastUser: '' };
+const modelState = { mode: 'ok', lastUser: '', failNext: 0 };
 // Собственный адрес vision: туда уходит фоновый ?warm=1.
 const selfCalls = [];
 
@@ -83,6 +83,12 @@ s3.mount('kb.test', async function (url, init) {
 });
 
 s3.mount('ai.api.cloud.yandex.net', async function (url, init) {
+  if (modelState.failNext > 0) {
+    modelState.failNext--;
+
+    return { status: 500, body: { error: 'boom' } };
+  }
+
   const sent = JSON.parse(String(init.body || '{}'));
 
   modelState.lastUser = String(
@@ -489,6 +495,229 @@ async function main() {
 
   check('стрим: без названной игры прогрева нет',
     selfCalls.length === 0, selfCalls.join(' | '));
+
+  // --- 18. смена игры: ответ и ready прошлой игры не всплывают ---
+  s3.reset();
+  const gA = blank();
+  gA.game = 'Minecraft';
+  gA.gameSetAt = Date.now();
+  gA.answers['301'] = doneRecord({ game: GAME, cid: 'c-old-1' });
+  s3.put('state.json', gA);
+
+  const cfgOld = await call({ config: '1' });
+  const rdOld = await call({ ready: '1' });
+
+  check('смена игры: готовый ответ прошлой игры не всплывает',
+    cfgOld.body.ready === null, JSON.stringify(cfgOld.body.ready));
+  check('смена игры: ?ready тоже молчит',
+    rdOld.body.ready === null, JSON.stringify(rdOld.body.ready));
+
+  // --- 19. смена игры отменяет незавершённый вопрос и снимает маркер ---
+  s3.reset();
+  const gC = blank();
+  gC.game = GAME;
+  gC.gameSetAt = Date.now();
+  gC.marker = { type: 'rect', x1: 10, y1: 10, x2: 20, y2: 20 };
+  gC.markerSetAt = Date.now();
+  gC.answers['302'] = {
+    status: 'pending', q: 'что за персонаж', game: GAME, uid: UID,
+    createdAt: Math.floor(Date.now() / 1000), createdAtMs: Date.now()
+  };
+  s3.put('state.json', gC);
+
+  const swGame = await post({ game: 'Minecraft' });
+  const gAfter = s3.get('state.json') || {};
+
+  check('смена игры: принято', swGame.body.status === 'ok', swGame.body.status);
+  check('смена игры: старый вопрос отменён',
+    gAfter.answers && gAfter.answers['302'] &&
+    gAfter.answers['302'].status === 'cancelled',
+    JSON.stringify(gAfter.answers && gAfter.answers['302']));
+  check('смена игры: маркер снят', gAfter.marker === null,
+    JSON.stringify(gAfter.marker));
+  check('смена игры: игра записана', gAfter.game === 'Minecraft', gAfter.game);
+
+  // --- 20. та же игра не трогает незавершённый вопрос ---
+  s3.reset();
+  const gD = blank();
+  gD.game = GAME;
+  gD.gameSetAt = Date.now();
+  gD.answers['303'] = {
+    status: 'pending', q: 'где найти аптечку', game: GAME, uid: UID,
+    createdAt: Math.floor(Date.now() / 1000), createdAtMs: Date.now()
+  };
+  s3.put('state.json', gD);
+
+  await post({ game: GAME });
+
+  const gSame = s3.get('state.json') || {};
+
+  check('та же игра: вопрос не отменён',
+    gSame.answers && gSame.answers['303'] &&
+    gSame.answers['303'].status === 'pending',
+    JSON.stringify(gSame.answers && gSame.answers['303']));
+
+  // --- 21. прогрев прошлой игры не затирает статус новой ---
+  const mergedWarm = mv.__test.mergeState(
+    {
+      game: GAME, gameSetAt: 1, answers: {}, qcache: {}, users: {},
+      warm: { game: GAME, status: 'ok', at: 99 }
+    },
+    {
+      game: 'Minecraft', gameSetAt: 5, answers: {}, qcache: {}, users: {},
+      warm: { game: 'Minecraft', status: 'scheduled', at: 5 }
+    },
+    Date.now()
+  );
+
+  check('прогрев: игра берётся новая', mergedWarm.game === 'Minecraft',
+    mergedWarm.game);
+  check('прогрев: статус новой игры не затёрт старой',
+    mergedWarm.warm && mergedWarm.warm.game === 'Minecraft' &&
+    mergedWarm.warm.status === 'scheduled',
+    JSON.stringify(mergedWarm.warm));
+
+  // --- 22. сбой модели: один повтор возвращает ответ ---
+  s3.reset();
+  kbState.mode = 'empty';
+  modelState.mode = 'ok';
+  modelState.failNext = 1;
+  selfCalls.length = 0;
+
+  const fst = blank();
+  fst.game = GAME;
+  fst.gameSetAt = Date.now();
+  fst.lastFrameTs = Math.floor(Date.now() / 1000);
+  fst.warm = {
+    game: GAME, status: 'ok', at: Date.now(), startedAt: Date.now(), pages: 6
+  };
+  fst.ring = [{ ts: fst.lastFrameTs, size: 8, key: 'frames/f1.jpg' }];
+  s3.put('state.json', fst);
+  s3.put('frames/f1.jpg', 'jpegdata');
+
+  const retried = await post({
+    q: 'что видно на экране сейчас', game: GAME, cid: 'c-retry-1', uid: UID
+  });
+
+  check('модель: повтор после 5xx дал ответ',
+    retried.body.status === 'done' && !!retried.body.text,
+    JSON.stringify(retried.body).slice(0, 140));
+  check('модель: ответ по кадру', retried.body.src === 'screen',
+    retried.body.src);
+
+  // --- 23. два сбоя подряд: ошибка видна в диагностике ---
+  s3.reset();
+  kbState.mode = 'empty';
+  modelState.mode = 'ok';
+  modelState.failNext = 2;
+
+  const fst2 = blank();
+  fst2.game = GAME;
+  fst2.gameSetAt = Date.now();
+  fst2.lastFrameTs = Math.floor(Date.now() / 1000);
+  fst2.warm = {
+    game: GAME, status: 'ok', at: Date.now(), startedAt: Date.now(), pages: 6
+  };
+  fst2.ring = [{ ts: fst2.lastFrameTs, size: 8, key: 'frames/f1.jpg' }];
+  s3.put('state.json', fst2);
+  s3.put('frames/f1.jpg', 'jpegdata');
+
+  const failedCall = await post({
+    q: 'какой сейчас уровень', game: GAME, cid: 'c-retry-2', uid: UID
+  });
+
+  check('модель: после двух сбоев честный unk',
+    failedCall.body.status === 'done' && failedCall.body.unk === true,
+    JSON.stringify(failedCall.body).slice(0, 140));
+
+  const dg = await call({ diag: '1' });
+
+  check('диагностика: версия', dg.body.ver === '4.0.0', dg.body.ver);
+  check('диагностика: игра и прогрев',
+    dg.body.game === GAME && dg.body.warm && dg.body.warm.game === GAME,
+    JSON.stringify(dg.body.warm));
+  check('диагностика: последние ответы',
+    Array.isArray(dg.body.recent) && dg.body.recent.length > 0,
+    JSON.stringify(dg.body.recent).slice(0, 120));
+  check('диагностика: время ответа считается',
+    dg.body.recent.some(r => typeof r.ms === 'number' && r.ms >= 0),
+    JSON.stringify(dg.body.recent).slice(0, 160));
+  check('диагностика: размер состояния оценён',
+    dg.body.state_bytes > 100, dg.body.state_bytes);
+  check('диагностика: флаги базы и модели',
+    dg.body.kb && dg.body.kb.url === true && dg.body.kb.token === true &&
+    dg.body.model && dg.body.model.key === true,
+    JSON.stringify(dg.body.kb) + JSON.stringify(dg.body.model));
+  check('диагностика: ошибка модели зафиксирована',
+    !!dg.body.last_model_error && dg.body.last_model_error.err !== 0,
+    JSON.stringify(dg.body.last_model_error));
+  check('диагностика: готовый ответ учтён',
+    dg.body.answers && (dg.body.answers.done || dg.body.answers.cancelled ||
+      dg.body.answers.pending), JSON.stringify(dg.body.answers));
+
+  // --- 24. токен заголовком X-Moon-Token ---
+  const pingH = await mv.handler({
+    httpMethod: 'GET',
+    headers: { 'X-Moon-Token': TOKEN },
+    queryStringParameters: { ping: '1' }
+  });
+  const pingBad = await mv.handler({
+    httpMethod: 'GET',
+    headers: { 'x-moon-token': 'wrong-token' },
+    queryStringParameters: { ping: '1' }
+  });
+  const pingNone = await mv.handler({
+    httpMethod: 'GET',
+    headers: {},
+    queryStringParameters: { ping: '1' }
+  });
+
+  check('токен заголовком: доступ есть', pingH.statusCode === 200,
+    pingH.statusCode);
+  check('токен заголовком: чужой отклонён', pingBad.statusCode === 403,
+    pingBad.statusCode);
+  check('без токена: отказ', pingNone.statusCode === 403,
+    pingNone.statusCode);
+
+  // --- 25. зависший прогрев перестаёт долбить сам себя ---
+  s3.reset();
+  const stuck = blank();
+  stuck.game = GAME;
+  stuck.gameSetAt = Date.now();
+  stuck.warm = {
+    game: GAME, status: 'scheduled', at: Date.now() - 200000,
+    startedAt: Date.now() - 200000, pages: 0, kicks: 3
+  };
+  s3.put('state.json', stuck);
+  selfCalls.length = 0;
+
+  await call({ poll: '1' });
+
+  check('прогрев: после трёх неудач пауза, а не новый вызов',
+    selfCalls.length === 0, selfCalls.join(' | '));
+
+  s3.reset();
+  const half = blank();
+  half.game = GAME;
+  half.gameSetAt = Date.now();
+  half.warm = {
+    game: GAME, status: 'scheduled', at: Date.now() - 200000,
+    startedAt: Date.now() - 200000, pages: 0, kicks: 1
+  };
+  s3.put('state.json', half);
+  selfCalls.length = 0;
+
+  await call({ poll: '1' });
+
+  check('прогрев: зависший вызов повторяется не сразу',
+    selfCalls.length === 1, selfCalls.join(' | '));
+
+  // --- 26. часовая копия состояния ---
+  const hourKey = 'backup/state-' +
+    new Date().toISOString().slice(0, 13).replace(/[-:T]/g, '') + '.json';
+
+  check('резервная копия: создана в этом часу',
+    s3.get(hourKey) !== null, hourKey);
 
   const failed = results.filter(r => !r.ok);
 

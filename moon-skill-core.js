@@ -17,8 +17,14 @@ const crypto = require('crypto');
 // v9.8:
 // - после выбора игры сразу прогревается база знаний этой игры (?warm=1);
 // - любая игра работает одинаково: вика ищется по названию, база создаётся сама.
+// v10.0:
+// - токен уходит заголовком X-Moon-Token, а не в адресе запроса;
+// - адрес vision можно переопределить переменной VISION_URL.
 
-const CLOUD_URL = 'https://functions.yandexcloud.net/d4el6hpg7nh0cui52kd2';
+const CLOUD_URL = String(
+  process.env.VISION_URL ||
+  'https://functions.yandexcloud.net/d4el6hpg7nh0cui52kd2'
+);
 
 // Токен берётся из переменной окружения MOON_TOKEN.
 // Его значение должно совпадать с AUTH_TOKEN в настройках moon-vision.
@@ -34,7 +40,7 @@ const POLL_STEP_MS      = 120;
 const ASYNC_CREATE_GRACE_MS = 60000;
 const FOLLOWUP_TTL_MS   = 120000;
 const FOLLOWUP_CEIL_MS  = 300000;
-const VER               = '9.8-a-v3.9-moon-async';
+const VER               = '10.0-a-v4.0-moon-async';
 const VOICE_MAX         = 400;
 
 function isTokenConfigured() {
@@ -199,9 +205,16 @@ async function cloudFetch(path, init, timeoutMs) {
     return { status: 0, body: { status: 'config_error' }, kind: 'config' };
   }
 
+  const opts = init || {};
+
   try {
-    const res = await fetch(CLOUD_URL + path, {
-      ...init,
+    const res = await fetch(CLOUD_URL + (path || ''), {
+      ...opts,
+      // Токен заголовком: он не попадает в адрес, логи прокси и историю.
+      headers: Object.assign(
+        { 'X-Moon-Token': TOKEN },
+        opts.headers || {}
+      ),
       signal: AbortSignal.timeout(timeoutMs)
     });
     const text = await res.text();
@@ -232,7 +245,7 @@ async function ask(q, game, cid, supersede, timeoutMs, uid) {
   if (uid) payload.uid = uid;
   if (supersede) payload.supersede = String(supersede).slice(0, 64);
 
-  return await cloudFetch('?token=' + encodeURIComponent(TOKEN), {
+  return await cloudFetch('', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
@@ -240,7 +253,7 @@ async function ask(q, game, cid, supersede, timeoutMs, uid) {
 }
 
 async function answer(qid, cid, timeoutMs, uid) {
-  const p = '?token=' + encodeURIComponent(TOKEN) + '&answer=1' +
+  const p = '?answer=1' +
     (qid ? '&qid=' + encodeURIComponent(qid) : '') +
     (cid ? '&cid=' + encodeURIComponent(cid) : '') +
     (uid ? '&uid=' + encodeURIComponent(uid) : '');
@@ -250,7 +263,7 @@ async function answer(qid, cid, timeoutMs, uid) {
 
 // Лёгкий опрос состояния задачи: не запускает обработку на сервере.
 async function progress(cid, uid, timeoutMs) {
-  const p = '?token=' + encodeURIComponent(TOKEN) + '&progress=1' +
+  const p = '?progress=1' +
     (cid ? '&cid=' + encodeURIComponent(cid) : '') +
     (uid ? '&uid=' + encodeURIComponent(uid) : '');
   const r = await cloudFetch(p, { method: 'GET' },
@@ -263,7 +276,7 @@ async function setGame(game, supersede, timeoutMs, uid) {
   const payload = { game: String(game).slice(0, 60) };
   if (uid) payload.uid = uid;
   if (supersede) payload.supersede = String(supersede).slice(0, 64);
-  return await cloudFetch('?token=' + encodeURIComponent(TOKEN), {
+  return await cloudFetch('', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
@@ -274,7 +287,7 @@ async function setGame(game, supersede, timeoutMs, uid) {
 // механики) грузятся сразу, чтобы первые вопросы отвечались без вики.
 // В реплике Алисы держим короткий срок; сама загрузка идёт на стороне vision.
 async function warm(game, timeoutMs, uid) {
-  const p = '?token=' + encodeURIComponent(TOKEN) + '&warm=1&game=' +
+  const p = '?warm=1&game=' +
     encodeURIComponent(String(game || '').slice(0, 60)) +
     (uid ? '&uid=' + encodeURIComponent(uid) : '');
   const r = await cloudFetch(p, { method: 'GET' }, Math.max(200, timeoutMs));
@@ -301,7 +314,7 @@ function warmTail(w) {
 async function fetchUserGame(uid, timeoutMs) {
   if (!uid) return '';
   const r = await cloudFetch(
-    '?token=' + encodeURIComponent(TOKEN) + '&usergame=1&uid=' + encodeURIComponent(uid),
+    '?usergame=1&uid=' + encodeURIComponent(uid),
     { method: 'GET' }, timeoutMs || 800
   );
   return (r.kind === 'ok' && r.body && typeof r.body.game === 'string')

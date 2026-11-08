@@ -38,7 +38,7 @@ const MAX_GAME = 60;
 const MAX_BODY = 2 * 1024 * 1024;
 const MARKER_INTERVAL_S = 3;
 const MARKER_FRESH_S = 5;
-const BACKEND_VERSION = '3.2.0';
+const BACKEND_VERSION = '4.0.0';
 const KB_URL = process.env.KB_URL || '';
 const KB_TOKEN = process.env.KB_TOKEN || '';
 const KB_TIMEOUT_MS = 8000;
@@ -67,6 +67,12 @@ const WARM_ERROR_RETRY_MS = 5 * 60 * 1000;
 const WARM_STALE_MS = 120000;
 const GAME_FRESH_MS = 12 * 3600 * 1000;
 const KEEP_USERS = 32;
+const MODEL_RETRIES = 1;
+const MODEL_RETRY_DELAY_MS = 500;
+const RETRY_STATUS = [408, 429, 500, 502, 503, 504];
+const BACKUP_MIN_MS = 3600 * 1000;
+const DIAG_ANSWERS = 6;
+const POLL_MARK_MS = 30000;
 
 const SYS = 'Ты — Лунный Ассистент. Отвечай по-русски, кратко: 1–3 предложения, до 400 знаков. Верни только JSON вида {"speech":"текст","unk":false,"conf":0.8,"clarify":null,"marker":null}. Факты разрешено утверждать только если они прямо подтверждаются переданными свежими кадрами. Не используй внутренние знания об игре, догадки, фанатские названия или непроверенную локализацию. Название предмета, локации, персонажа, навыка или стойки произноси только если оно отчётливо читается на русском интерфейсе кадра; иначе не называй его. Названия переписывай с кадра буква в букву, не заменяй похожими словами и не исправляй по памяти; если буквы неразборчивы, скажи «вариант слева/в центре/справа» вместо названия. Если кадры не подтверждают ответ, верни unk=true и conf=0. Если игрок просит совет или выбрать лучший из вариантов, которые видны на кадре (меню, предыстории, диалоговые реплики, предметы), можно рекомендовать один вариант, опираясь только на читаемые на кадре названия и описания, и одной фразой назвать причину из этого текста; это не unk. Если референт нельзя однозначно определить из текущего кадра и вопроса, верни clarify с коротким уточнением. conf — самооценка от 0 до 1, не измеренная вероятность. Не добавляй фактов, которых нет в кадрах.';
 
@@ -84,7 +90,23 @@ function jres(r) {
 
 function hdr(event, name) {
   const h = (event && event.headers) || {};
-  return String(h[name] || h[name.toLowerCase()] || h[name.toUpperCase()] || '');
+  const direct = h[name] !== undefined
+    ? h[name]
+    : (h[name.toLowerCase()] !== undefined
+      ? h[name.toLowerCase()]
+      : h[name.toUpperCase()]);
+
+  if (direct !== undefined) return String(direct);
+
+  const want = String(name).toLowerCase();
+
+  for (const k of Object.keys(h)) {
+    if (String(k).toLowerCase() === want && h[k] !== undefined) {
+      return String(h[k]);
+    }
+  }
+
+  return '';
 }
 
 function readBody(event) {
@@ -145,7 +167,9 @@ function blankState() {
     answers: {},
     qcache: {},
     users: {},
-    warm: null
+    warm: null,
+    lastPollAt: 0,
+    backupAt: 0
   };
 }
 
@@ -320,6 +344,25 @@ function pickRec(a, c, now) {
   return recVer(a) >= recVer(c) ? a : c;
 }
 
+// Берём запись прогрева той игры, которая сейчас в состоянии: иначе результат
+// старого прогрева, закончившись позже, затрёт статус новой игры.
+function pickWarm(st, cur, game) {
+  const sw = (st && st.warm) || null;
+  const cw = (cur && cur.warm) || null;
+
+  const same = w => !!(w && w.game && game &&
+    normalize(w.game) === normalize(game));
+
+  if (same(sw) && same(cw)) {
+    return (sw.at || 0) >= (cw.at || 0) ? sw : cw;
+  }
+
+  if (same(sw)) return sw;
+  if (same(cw)) return cw;
+
+  return sw || cw || null;
+}
+
 function mergeState(st, cur, now) {
   if (!cur) return st;
 
@@ -380,6 +423,13 @@ function mergeState(st, cur, now) {
   }
 
   m.users = us;
+
+  // Прогрев относится к конкретной игре: запись прошлой игры не должна
+  // перетирать статус текущей после смены игры на стриме.
+  m.warm = pickWarm(st, cur, m.game);
+  m.lastPollAt = Math.max(st.lastPollAt || 0, cur.lastPollAt || 0);
+  m.backupAt = Math.max(st.backupAt || 0, cur.backupAt || 0);
+
   pruneState(m);
 
   return m;
@@ -436,6 +486,30 @@ function pruneState(m) {
   }
 }
 
+// Смена игры на стриме: незавершённые ответы прошлой игры больше не нужны —
+// их результат относился бы к другому экрану и другой базе. Заодно освобождаем
+// модель: брошенный ответ не должен досказываться в новый стрим.
+function cancelOtherGameAnswers(st, game, uid) {
+  const want = normalize(game || '');
+  const now = nowS();
+  let changed = 0;
+
+  for (const id of Object.keys(st.answers || {})) {
+    const rec = st.answers[id];
+
+    if (!rec || TERMINAL.includes(rec.status)) continue;
+    if (normalize(rec.game || '') === want) continue;
+    if (uid && rec.uid && rec.uid !== uid) continue;
+
+    rec.status = 'cancelled';
+    rec.cancelledAt = now;
+    rec.cancelWhy = 'game_changed';
+    changed++;
+  }
+
+  return changed;
+}
+
 // Запись чужого uid недоступна; записи без uid — режим совместимости.
 function ownerOk(rec, uid) {
   return !uid || !rec || !rec.uid || rec.uid === uid;
@@ -457,6 +531,11 @@ async function saveState(st) {
     }
 
     const merged = mergeState(st, cur ? cur.obj : null, Date.now());
+
+    const needBackup = Date.now() - (merged.backupAt || 0) >= BACKUP_MIN_MS;
+
+    if (needBackup) merged.backupAt = Date.now();
+
     const buf = Buffer.from(JSON.stringify(merged), 'utf8');
 
     let r = null;
@@ -475,6 +554,20 @@ async function saveState(st) {
 
     if (r && r.status < 300) {
       Object.assign(st, merged);
+
+      if (needBackup) {
+        // Часовая копия состояния: одна битая запись не уносит игру и кэш.
+        try {
+          await s3Put(
+            'backup/state-' +
+              new Date().toISOString()
+                .slice(0, 13).replace(/[-:T]/g, '') + '.json',
+            Buffer.from(JSON.stringify(merged), 'utf8'),
+            'application/json'
+          );
+        } catch (e) { /* копия не должна ломать запись */ }
+      }
+
       return true;
     }
 
@@ -801,10 +894,21 @@ function contextualQuery(st, uid, nq) {
 
 // ---------- answer_ready для оверлея ----------
 
+// Ответ и маркер принадлежат игре, в которой были получены. После смены игры
+// на стриме они не должны всплывать поверх нового экрана.
+function sameGame(st, rec) {
+  const cur = normalize((st && st.game) || '');
+
+  if (!cur) return true;
+
+  return normalize((rec && rec.game) || '') === cur;
+}
+
 function readyFor(st) {
   const entries = Object.keys(st.answers || {})
     .map(id => ({ id: id, rec: st.answers[id] }))
     .filter(x => x.rec &&
+      sameGame(st, x.rec) &&
       x.rec.status === 'done' &&
       !x.rec.ackedAt &&
       x.rec.show !== true &&
@@ -886,6 +990,48 @@ function kbAnswerHint(meta) {
   return '';
 }
 
+// Модель иногда отвечает 5xx/429 или обрывает соединение. Один быстрый повтор
+// возвращает ответ, который иначе превратился бы в «не могу подтвердить».
+async function modelRequest(body) {
+  let last = null;
+
+  for (let attempt = 0; attempt <= MODEL_RETRIES; attempt++) {
+    if (attempt) await sleep(MODEL_RETRY_DELAY_MS);
+
+    try {
+      const res = await fetch(AI_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Api-Key ' + YC_API_KEY,
+          'OpenAI-Project': FOLDER_ID
+        },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(MODEL_TIMEOUT_MS)
+      });
+
+      if (res.status === 200 ||
+          RETRY_STATUS.indexOf(res.status) < 0 ||
+          attempt === MODEL_RETRIES) {
+        return res;
+      }
+
+      console.error('mv model: http=' + res.status + ' retry');
+
+      // Тело не нужно; освобождаем соединение и повторяем запрос.
+      try { await res.text(); } catch (e) { /* ignore */ }
+    } catch (e) {
+      last = e;
+
+      if (attempt === MODEL_RETRIES) throw e;
+
+      console.error('mv model: ' + (e && e.message) + ' retry');
+    }
+  }
+
+  throw last || new Error('model failed');
+}
+
 async function callKnowledgeModel(game, q, evidence, meta) {
   if (!YC_API_KEY || !MODEL_URI) {
     throw new Error('model not configured');
@@ -913,21 +1059,14 @@ async function callKnowledgeModel(game, q, evidence, meta) {
     reasoning_effort: 'none'
   };
 
-  const res = await fetch(AI_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': 'Api-Key ' + YC_API_KEY,
-      'OpenAI-Project': FOLDER_ID
-    },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(MODEL_TIMEOUT_MS)
-  });
+  const res = await modelRequest(body);
 
   if (res.status !== 200) {
     console.error('mv KB model: http=' + res.status);
 
     const err = new Error('KB model http ' + res.status);
+
+    err.status = res.status;
 
     if (res.status >= 400 && res.status < 500 &&
         res.status !== 408 && res.status !== 429) {
@@ -994,21 +1133,14 @@ async function callModel(game, q, frames, frameIds, show) {
     reasoning_effort: 'none'
   };
 
-  const res = await fetch(AI_URL, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': 'Api-Key ' + YC_API_KEY,
-      'OpenAI-Project': FOLDER_ID
-    },
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(MODEL_TIMEOUT_MS)
-  });
+  const res = await modelRequest(body);
 
   if (res.status !== 200) {
     console.error('mv model: http=' + res.status);
 
     const err = new Error('model http ' + res.status);
+
+    err.status = res.status;
 
     if (res.status >= 400 && res.status < 500 &&
         res.status !== 408 && res.status !== 429) {
@@ -1194,7 +1326,7 @@ function freshAnswerWithMarker(st) {
   const entries = Object.keys(st.answers || {}).map(id => ({
     id: id,
     rec: st.answers[id]
-  })).filter(x => x.rec);
+  })).filter(x => x.rec && sameGame(st, x.rec));
 
   if (!entries.length) return null;
 
@@ -1299,6 +1431,11 @@ async function saveClaimResult(id, claimId, out) {
     rec.resultStatus = out.resultStatus === 'clarify'
       ? 'clarify'
       : 'done';
+
+    if (out.errorStatus) {
+      rec.errorStatus = Number(out.errorStatus) || 0;
+      rec.errorAt = nowS();
+    }
 
     cur.obj.lastAnswerText = out.text;
     cur.obj.lastAnswerAt = Date.now();
@@ -1520,7 +1657,8 @@ async function processOne(st, id) {
           conf: 0,
           src: 'none',
           frame_id: null,
-          resultStatus: 'done'
+          resultStatus: 'done',
+          errorStatus: Number(e && e.status) || -1
         };
       }
     }
@@ -1571,10 +1709,25 @@ async function handleGame(game, supersedeValue, uidValue) {
     old.rec.supersededAt = nowS();
   }
 
-  st.game = cleanGameStr(game);
+  const nextGame = cleanGameStr(game);
+  const changedGame = normalize(nextGame) !== normalize(st.game || '');
+
+  st.game = nextGame;
   st.gameSetAt = Date.now();
 
   rememberUserGame(st, cleanUid(uidValue), st.game);
+
+  if (changedGame) {
+    // Маркер и незавершённые ответы относятся к прошлой игре.
+    const cancelled = cancelOtherGameAnswers(st, nextGame, '');
+
+    st.marker = null;
+    st.markerSetAt = Date.now();
+
+    if (cancelled) {
+      console.log('mv game change: cancelled ' + cancelled);
+    }
+  }
 
   if (!(await saveState(st))) {
     return { code: 503, body: { status: 'wait' } };
@@ -1597,6 +1750,10 @@ function needsWarm(st, game) {
   if (!w || !w.game || normalize(w.game) !== normalize(game)) return true;
 
   if (w.status === 'scheduled' || w.status === 'running') {
+    // Если фоновый вызов не доходит (неверный SELF_URL), не долбим его
+    // каждые две минуты весь стрим: после трёх попыток — пауза на полчаса.
+    if ((w.kicks || 0) >= 3) return now - (w.startedAt || w.at || 0) > WARM_RETRY_MS;
+
     return now - (w.startedAt || w.at || 0) > WARM_STALE_MS;
   }
 
@@ -1615,12 +1772,18 @@ function needsWarm(st, game) {
 // Отметка «прогрев поставлен в очередь»: попадает в state.json до запуска,
 // поэтому следующие вопросы не ставят его повторно.
 function markWarmScheduled(st, game) {
+  const prev = st.warm && st.warm.game &&
+    normalize(st.warm.game) === normalize(game)
+    ? st.warm
+    : null;
+
   st.warm = {
     game: game,
     status: 'scheduled',
     at: Date.now(),
     startedAt: Date.now(),
-    pages: 0
+    pages: 0,
+    kicks: ((prev && prev.kicks) || 0) + 1
   };
 }
 
@@ -1630,13 +1793,14 @@ function markWarmScheduled(st, game) {
 async function kickWarm(game, uid, timeoutMs) {
   if (!isWarmConfigured()) return false;
 
-  const url = SELF_URL + '?warm=1&token=' + encodeURIComponent(TOKEN) +
+  const url = SELF_URL + '?warm=1' +
     '&game=' + encodeURIComponent(String(game || '').slice(0, 60)) +
     (uid ? '&uid=' + encodeURIComponent(uid) : '');
 
   try {
     await fetch(url, {
       method: 'GET',
+      headers: { 'X-Moon-Token': TOKEN },
       signal: AbortSignal.timeout(Math.max(200, timeoutMs || 400))
     });
     return true;
@@ -1703,7 +1867,8 @@ async function handleWarm(qp) {
     status: 'running',
     at: Date.now(),
     startedAt: (prev && prev.startedAt) || Date.now(),
-    pages: (prev && prev.pages) || 0
+    pages: (prev && prev.pages) || 0,
+    kicks: (prev && prev.kicks) || 0
   };
 
   await saveState(st);
@@ -1879,6 +2044,13 @@ function effectiveGame(st, requested, uid) {
   return '';
 }
 
+// Ответ другого стрима (игра уже сменилась) не отдаём: он относится
+// к прошлому экрану и прошлой базе.
+function otherGameRec(st, rec) {
+  return !!(rec && rec.game && st && st.game &&
+    normalize(rec.game) !== normalize(st.game));
+}
+
 // U2: последний запрос конкретного uid (не глобальный «свежайший»).
 function findLatestByUid(st, uid) {
   if (!uid) return null;
@@ -1999,9 +2171,20 @@ async function handleAsk(q, game, cidValue, supersedeValue, uidValue) {
   }
 
   if (game) {
+    const changedGame = normalize(requestedGame) !== normalize(st.game || '');
+
     st.game = requestedGame;
     st.gameSetAt = Date.now();
     rememberUserGame(st, uid, requestedGame);
+
+    // Вопрос по другой игре: всё, что ещё считается по прошлой, уже не нужно.
+    if (changedGame) {
+      const cancelled = cancelOtherGameAnswers(st, requestedGame, uid);
+
+      if (cancelled) {
+        console.log('mv ask game change: cancelled ' + cancelled);
+      }
+    }
   }
 
   // Первый вопрос по новой или давно не обновлявшейся игре сам запускает
@@ -2283,6 +2466,13 @@ async function handleAnswer(qidParam, cidValue, uidValue) {
     };
   }
 
+  if (otherGameRec(st, rec)) {
+    return {
+      code: 200,
+      body: { status: 'none', qid: Number(id), cid: cid || '' }
+    };
+  }
+
   if (cid && rec.cid && rec.cid !== cid) {
     return {
       code: 404,
@@ -2444,6 +2634,10 @@ async function progressOut(qp) {
     return { code: 200, body: { status: 'none', qid: Number(id) } };
   }
 
+  if (otherGameRec(st, rec)) {
+    return { code: 200, body: { status: 'none', qid: Number(id) } };
+  }
+
   const body = {
     status: rec.status,
     qid: Number(id),
@@ -2462,6 +2656,72 @@ async function progressOut(qp) {
   }
 
   return { code: 200, body: body };
+}
+
+// ?diag=1 — снимок «как оно сейчас» для проверки без логов Yandex Cloud:
+// версии, игра, прогрев, последние ответы с временем и источником, ошибки
+// модели, размеры состояния. Секретов внутри нет.
+function diagOut(st) {
+  const now = nowS();
+  const all = Object.values(st.answers || {}).filter(r => r && r.q);
+
+  const recent = all
+    .slice()
+    .sort((a, b) => (b.createdAtMs || 0) - (a.createdAtMs || 0))
+    .slice(0, DIAG_ANSWERS)
+    .map(r => ({
+      q: String(r.q || '').slice(0, 80),
+      game: r.game || '',
+      status: r.status,
+      src: r.src || 'none',
+      unk: r.unk === true,
+      ms: (r.doneAtMs && r.createdAtMs)
+        ? r.doneAtMs - r.createdAtMs
+        : null,
+      at: r.createdAt || 0,
+      err: r.errorStatus || 0
+    }));
+
+  const byStatus = {};
+
+  for (const r of Object.values(st.answers || {})) {
+    if (!r) continue;
+
+    const k = r.status || 'unknown';
+    byStatus[k] = (byStatus[k] || 0) + 1;
+  }
+
+  const errs = recent.filter(r => r.err).sort((a, b) => b.at - a.at);
+
+  return {
+    code: 200,
+    body: {
+      status: 'ok',
+      ver: BACKEND_VERSION,
+      uptime_s: Math.round(
+        typeof process.uptime === 'function' ? process.uptime() : 0
+      ),
+      game: st.game || '',
+      game_age_s: st.gameSetAt
+        ? Math.max(0, Math.round((Date.now() - st.gameSetAt) / 1000))
+        : null,
+      frame_age_s: st.lastFrameTs ? Math.max(0, now - st.lastFrameTs) : null,
+      poll_age_s: st.lastPollAt
+        ? Math.max(0, Math.round((Date.now() - st.lastPollAt) / 1000))
+        : null,
+      warm: st.warm || null,
+      answers: byStatus,
+      qcache: Object.keys(st.qcache || {}).length,
+      users: Object.keys(st.users || {}).length,
+      ring: (st.ring || []).length,
+      state_bytes: Buffer.byteLength(JSON.stringify(st), 'utf8'),
+      last_model_error: errs[0] || null,
+      ready: readyFor(st) ? true : false,
+      kb: { url: !!KB_URL, token: !!KB_TOKEN, self: !!SELF_URL },
+      model: { uri: !!MODEL_URI, key: !!YC_API_KEY, folder: !!FOLDER_ID },
+      recent: recent
+    }
+  };
 }
 
 function configOut(st) {
@@ -2484,6 +2744,15 @@ function configOut(st) {
 }
 
 async function pollOut(st) {
+  // Отметка опроса для ?health=1 и ?diag=1; пишем не чаще раза в 30 с.
+  if (Date.now() - (st.lastPollAt || 0) >= POLL_MARK_MS) {
+    st.lastPollAt = Date.now();
+
+    try {
+      await saveState(st);
+    } catch (e) { /* опрос не должен падать из-за отметки */ }
+  }
+
   // Приложение опрашивает этот роут каждые 1,5 с с момента старта стрима,
   // поэтому прогрев стартует здесь, не дожидаясь первого вопроса.
   await maybeWarmFromStream(st, '');
@@ -2526,7 +2795,9 @@ async function route(event) {
 
   const qp = (event && event.queryStringParameters) || {};
 
-  if (!tokenOk(qp.token)) {
+  // Токен можно передать заголовком X-Moon-Token: тогда он не попадает
+  // в адрес запроса и в логи прокси. Старый способ с ?token= работает.
+  if (!tokenOk(qp.token) && !tokenOk(hdr(event, 'x-moon-token'))) {
     return {
       code: 403,
       body: { status: 'forbidden' }
@@ -2562,7 +2833,9 @@ async function route(event) {
           ok: true,
           ver: BACKEND_VERSION,
           frame_age_s: age,
-          poll_age_s: null
+          poll_age_s: st.lastPollAt
+            ? Math.max(0, nowS() - st.lastPollAt)
+            : null
         }
       };
     }
@@ -2588,6 +2861,10 @@ async function route(event) {
         ).length
       }
     };
+  }
+
+  if (method === 'GET' && qp.diag === '1') {
+    return diagOut(await getState());
   }
 
   console.log('mv: ' + method + ' ' + Object.keys(qp).join(','));
@@ -2803,6 +3080,13 @@ async function route(event) {
     body: { status: 'method_not_allowed' }
   };
 }
+
+// Только для тестов: проверка слияния состояния без сети и S3.
+module.exports.__test = {
+  mergeState: mergeState,
+  pickWarm: pickWarm,
+  sameGame: sameGame
+};
 
 module.exports.handler = async function (event) {
   try {
