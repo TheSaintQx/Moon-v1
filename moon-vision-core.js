@@ -38,7 +38,7 @@ const MAX_GAME = 60;
 const MAX_BODY = 2 * 1024 * 1024;
 const MARKER_INTERVAL_S = 3;
 const MARKER_FRESH_S = 5;
-const BACKEND_VERSION = '3.0.0';
+const BACKEND_VERSION = '3.1.0';
 const KB_URL = process.env.KB_URL || '';
 const KB_TOKEN = process.env.KB_TOKEN || '';
 const KB_TIMEOUT_MS = 8000;
@@ -54,6 +54,17 @@ const KB_MAX_RESULTS = 7;
 const KB_MAX_EVIDENCE_CHARS = 1800;
 const KB_MAX_TOTAL_CHARS = 9000;
 const KB_WARM_TIMEOUT_MS = 45000;
+// Фоновый прогрев после первого вопроса: свой адрес функции и паузы между
+// попытками, чтобы повторные вопросы не запускали прогрев заново.
+const SELF_URL = String(
+  process.env.SELF_URL ||
+  'https://functions.yandexcloud.net/d4e1e6pg7nh0cu152kd2'
+).replace(/\/+$/, '');
+const WARM_OK_TTL_MS = 6 * 3600 * 1000;
+const WARM_RETRY_MS = 30 * 60 * 1000;
+const WARM_BUSY_RETRY_MS = 2 * 60 * 1000;
+const WARM_ERROR_RETRY_MS = 5 * 60 * 1000;
+const WARM_STALE_MS = 120000;
 const GAME_FRESH_MS = 12 * 3600 * 1000;
 const KEEP_USERS = 32;
 
@@ -133,7 +144,8 @@ function blankState() {
     markerSetAt: 0,
     answers: {},
     qcache: {},
-    users: {}
+    users: {},
+    warm: null
   };
 }
 
@@ -1573,6 +1585,71 @@ async function handleGame(game, supersedeValue, uidValue) {
   return { code: 200, body: { status: 'ok' } };
 }
 
+// Нужно ли прогревать базу по этой игре: записи нет, это другая игра, или
+// прошлый прогрев был слишком давно / упал. Паузы не дают запускать прогрев
+// на каждый вопрос.
+function needsWarm(st, game) {
+  if (!game || !KB_URL || !KB_TOKEN) return false;
+
+  const w = st && st.warm;
+  const now = Date.now();
+
+  if (!w || !w.game || normalize(w.game) !== normalize(game)) return true;
+
+  if (w.status === 'scheduled' || w.status === 'running') {
+    return now - (w.startedAt || w.at || 0) > WARM_STALE_MS;
+  }
+
+  const age = now - (w.at || 0);
+
+  if (w.status === 'ok') return age > WARM_OK_TTL_MS;
+  if (w.status === 'busy') return age > WARM_BUSY_RETRY_MS;
+  if (w.status === 'no_evidence' || w.status === 'needs_wiki' ||
+      w.status === 'not_configured') {
+    return age > WARM_RETRY_MS;
+  }
+
+  return age > WARM_ERROR_RETRY_MS;
+}
+
+// Отметка «прогрев поставлен в очередь»: попадает в state.json до запуска,
+// поэтому следующие вопросы не ставят его повторно.
+function markWarmScheduled(st, game) {
+  st.warm = {
+    game: game,
+    status: 'scheduled',
+    at: Date.now(),
+    startedAt: Date.now(),
+    pages: 0
+  };
+}
+
+// Запуск прогрева отдельной invocation (?warm=1 на собственном адресе).
+// Ждём только отправку запроса: сама загрузка статей идёт уже без нас и
+// не задерживает реплику Алисы.
+async function kickWarm(game, uid, timeoutMs) {
+  if (!isWarmConfigured()) return false;
+
+  const url = SELF_URL + '?warm=1&token=' + encodeURIComponent(TOKEN) +
+    '&game=' + encodeURIComponent(String(game || '').slice(0, 60)) +
+    (uid ? '&uid=' + encodeURIComponent(uid) : '');
+
+  try {
+    await fetch(url, {
+      method: 'GET',
+      signal: AbortSignal.timeout(Math.max(200, timeoutMs || 400))
+    });
+    return true;
+  } catch (e) {
+    // Таймаут ожидаем: цель — стартовать прогрев, а не дождаться его.
+    return !!(e && (e.name === 'TimeoutError' || e.name === 'AbortError'));
+  }
+}
+
+function isWarmConfigured() {
+  return !!(KB_URL && KB_TOKEN && TOKEN && SELF_URL);
+}
+
 // ?warm=1 — прогреть базу по текущей или названной игре.
 // Ответ возвращается после прогрева, поэтому в реплику Алисы его не ждут:
 // навык вызывает прогрев отдельным запросом с коротким таймаутом.
@@ -1597,16 +1674,36 @@ async function handleWarm(qp) {
   }
 
   const refresh = qp.refresh === '1' || qp.refresh === 'true';
+  const prev = st.warm && st.warm.game &&
+    normalize(st.warm.game) === normalize(game)
+    ? st.warm
+    : null;
+
+  // Сначала «running» в состоянии: следующий вопрос не запустит прогрев снова,
+  // пока этот не закончится или не упадёт.
+  st.warm = {
+    game: game,
+    status: 'running',
+    at: Date.now(),
+    startedAt: (prev && prev.startedAt) || Date.now(),
+    pages: (prev && prev.pages) || 0
+  };
+
+  await saveState(st);
+
+  const startedAt = st.warm.startedAt;
   const warm = await warmKnowledge(game, refresh);
 
   st.warm = {
     game: game,
     status: warm.status,
     at: Date.now(),
+    startedAt: startedAt,
     pages: warm.pages || 0,
     pageCount: warm.pageCount || 0,
     cached: !!warm.cached,
-    builtAt: warm.builtAt || ''
+    builtAt: warm.builtAt || '',
+    sections: warm.sections || {}
   };
 
   await saveState(st);
@@ -1885,6 +1982,12 @@ async function handleAsk(q, game, cidValue, supersedeValue, uidValue) {
     rememberUserGame(st, uid, requestedGame);
   }
 
+  // Первый вопрос по новой или давно не обновлявшейся игре сам запускает
+  // прогрев базы — отдельной invocation, чтобы не задерживать этот ответ.
+  const warmNeeded = needsWarm(st, requestedGame);
+
+  if (warmNeeded) markWarmScheduled(st, requestedGame);
+
   // Повтор POST с тем же CID возвращает уже существующий запрос.
   if (cid) {
     const existing = findAnswerByCid(st, cid);
@@ -2047,6 +2150,12 @@ async function handleAsk(q, game, cidValue, supersedeValue, uidValue) {
 
   if (!(await saveState(st))) {
     return { code: 503, body: { status: 'wait' } };
+  }
+
+  if (warmNeeded) {
+    // Отметка о запуске уже сохранена: даже если запрос не уйдёт,
+    // повторная попытка будет не раньше чем через WARM_STALE_MS/паузу.
+    await kickWarm(requestedGame, uid, 400);
   }
 
   if (cached) {

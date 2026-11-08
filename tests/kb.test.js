@@ -275,6 +275,33 @@ async function main() {
   check('тёплая база: повтор без перезагрузки',
     warmAgainBody.cached === true, JSON.stringify(warmAgainBody.cached));
 
+  const warmIndex = s3.get(ROOT + '/index.json');
+  check('тёплая база: индекс не теряет уже собранные страницы',
+    (warmIndex.items || []).some(x => x.pageId === 101) &&
+    (warmIndex.items || []).some(x => x.pageId === 201),
+    JSON.stringify((warmIndex.items || []).map(x => x.pageId)));
+
+  // Замок: параллельный прогрев (выбор игры + первый вопрос) не дублируется.
+  s3.put(ROOT + '/warm-lock.json', { at: Date.now() });
+
+  const busy = await kb.handler(warmEvent({ refresh: true }));
+  const busyBody = JSON.parse(busy.body);
+
+  check('тёплая база: параллельный прогрев не дублируется',
+    busyBody.status === 'busy', busyBody.status);
+
+  s3.put(ROOT + '/warm-lock.json', { at: 0 });
+
+  const refreshed = await kb.handler(warmEvent({ refresh: true }));
+  const refreshedBody = JSON.parse(refreshed.body);
+
+  check('тёплая база: refresh перечитывает статьи',
+    refreshedBody.cached === false && refreshedBody.status === 'ok',
+    JSON.stringify({ status: refreshedBody.status, cached: refreshedBody.cached }));
+  check('тёплая база: замок снят после прогрева',
+    (s3.get(ROOT + '/warm-lock.json') || {}).at === 0,
+    JSON.stringify(s3.get(ROOT + '/warm-lock.json')));
+
   const chars = await search({
     query: 'кто главные герои игры',
     limit: 3

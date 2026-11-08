@@ -28,6 +28,14 @@ const Q = 'когда основан найт сити';
 // --- подмена базы знаний и модели ---
 const kbState = { mode: 'empty', log: [], intent: null, comparison: null };
 const modelState = { mode: 'ok', lastUser: '' };
+// Собственный адрес vision: туда уходит фоновый ?warm=1.
+const selfCalls = [];
+
+s3.mount('functions.yandexcloud.net', async function (url) {
+  selfCalls.push(url.href);
+
+  return { status: 200, body: { status: 'ok' } };
+});
 
 s3.mount('kb.test', async function (url, init) {
   const body = JSON.parse(String(init.body || '{}'));
@@ -351,6 +359,70 @@ async function main() {
 
   kbState.intent = null;
   kbState.comparison = null;
+
+  // --- 11. первый вопрос по новой игре сам запускает прогрев в фоне ---
+  s3.reset();
+  s3.put('state.json', blank());
+  kbState.mode = 'hit';
+  modelState.mode = 'ok';
+  selfCalls.length = 0;
+
+  await post({
+    q: 'кто главные герои игры', game: GAME, cid: 'c-auto-1', uid: UID
+  });
+
+  const autoState = s3.get('state.json') || {};
+
+  check('фон: прогрев поставлен после первого вопроса',
+    autoState.warm && autoState.warm.status === 'scheduled',
+    JSON.stringify(autoState.warm));
+  check('фон: self-вызов ?warm=1 отправлен',
+    selfCalls.length === 1 && /warm=1/.test(selfCalls[0]),
+    selfCalls.join(' | '));
+  check('фон: в self-вызове передана игра',
+    selfCalls.length === 1 && /Cyberpunk/.test(decodeURIComponent(selfCalls[0])),
+    selfCalls.join(' | '));
+
+  // --- 12. повторный вопрос не дублирует прогрев ---
+  selfCalls.length = 0;
+
+  await post({
+    q: 'что это за персонаж', game: GAME, cid: 'c-auto-2', uid: UID
+  });
+
+  check('фон: повторный вопрос не греет повторно',
+    selfCalls.length === 0, selfCalls.join(' | '));
+
+  // --- 13. другая игра — новый прогрев ---
+  selfCalls.length = 0;
+
+  await post({
+    q: 'кто главные герои', game: 'Minecraft', cid: 'c-auto-3', uid: UID
+  });
+
+  check('фон: смена игры запускает новый прогрев',
+    selfCalls.length === 1 && /Minecraft/.test(decodeURIComponent(selfCalls[0])),
+    selfCalls.join(' | '));
+
+  // --- 14. уже тёплая база заново не греется ---
+  s3.reset();
+  const warmState = blank();
+  warmState.warm = {
+    game: GAME,
+    status: 'ok',
+    at: Date.now(),
+    startedAt: Date.now(),
+    pages: 6
+  };
+  s3.put('state.json', warmState);
+  selfCalls.length = 0;
+
+  await post({
+    q: 'кто главные герои игры', game: GAME, cid: 'c-auto-4', uid: UID
+  });
+
+  check('фон: тёплая база не перегревается',
+    selfCalls.length === 0, selfCalls.join(' | '));
 
   const failed = results.filter(r => !r.ok);
 

@@ -20,10 +20,15 @@
 //   (3) «что лучше: X или Y» разбирается на две сущности и обе ищутся отдельно;
 //   (4) пустой локальный ответ больше не заставляет ходить в вики на каждый
 //       русский вопрос: эскалация только при слабой выдаче.
+//
+// v0.8.0 — прогрев можно безопасно запускать в фоне:
+//   (1) замок warm-lock.json не даёт двум вызовам качать одну игру дважды;
+//   (2) индекс пишется слиянием, чтобы параллельный поиск и прогрев не теряли
+//       страницы друг друга.
 
 const crypto = require('crypto');
 
-const KB_VERSION = '0.7.0';
+const KB_VERSION = '0.8.0';
 
 // Быстрый режим: только локальный индекс, без сети и без записи в S3.
 const FAST_CANDIDATE_LIMIT = 10;
@@ -45,6 +50,7 @@ const MAX_QUERY_VARIANTS = 6;
 // Тёплая база: обзорные статьи по игре и бюджет на их загрузку.
 const WARM_PAGES_PER_QUERY = 3;
 const WARM_FORCED_PAGES = 3;
+const WARM_LOCK_MS = Math.max(30000, Number(process.env.KB_WARM_LOCK_MS || 120000));
 const WARM_BUDGET_MS = Math.min(
   90000,
   Math.max(5000, Number(process.env.KB_WARM_BUDGET_MS || 35000))
@@ -405,6 +411,32 @@ async function readJson(key) {
   return JSON.parse(r.body.toString('utf8'));
 }
 
+// Индекс могут писать одновременно поиск и прогрев. Перед записью перечитываем
+// его и сливаем по pageId, чтобы добавленные соседом страницы не потерялись.
+async function writeIndexMerged(id, index) {
+  const fresh = await readJson(indexKey(id)).catch(() => null);
+  const items = new Map();
+
+  for (const item of (fresh && fresh.items) || []) {
+    if (item && item.pageId !== undefined) items.set(item.pageId, item);
+  }
+
+  for (const item of (index && index.items) || []) {
+    if (item && item.pageId !== undefined) items.set(item.pageId, item);
+  }
+
+  const merged = Object.assign({}, fresh || {}, {
+    schemaVersion: (fresh && fresh.schemaVersion) || 1,
+    items: Array.from(items.values())
+  });
+
+  await writeJson(indexKey(id), merged);
+
+  if (index) index.items = merged.items;
+
+  return merged.items.length;
+}
+
 async function writeJson(key, value) {
   const r = await s3(
     'PUT',
@@ -441,6 +473,12 @@ function pageKey(id, pageId) {
 // Обзорные статьи игры: какие страницы относятся к персонажам, локациям и т.д.
 function warmKey(id) {
   return gameRoot(id) + '/warm.json';
+}
+
+// Замок прогрева: два запроса могут прийти одновременно (выбор игры и первый
+// вопрос). Без него обе invocation тянули бы вики и дважды писали в хранилище.
+function warmLockKey(id) {
+  return gameRoot(id) + '/warm-lock.json';
 }
 
 function allowedWikiHost(host) {
@@ -1424,7 +1462,7 @@ async function enrichWikiPages(id, manifest, index, pageIds) {
   }
 
   if (enriched) {
-    await writeJson(indexKey(id), index);
+    await writeIndexMerged(id, index);
 
     const m = await readJson(manifestKey(id)).catch(() => null) || manifest;
 
@@ -1730,7 +1768,7 @@ async function searchWikiOnDemand(id, manifest, index, variants) {
     manifest.updatedAt = new Date().toISOString();
     manifest.lastSearchFetchAt = manifest.updatedAt;
 
-    await writeJson(indexKey(id), index);
+    await writeIndexMerged(id, index);
     await writeJson(manifestKey(id), manifest);
   }
 
@@ -1909,6 +1947,23 @@ async function warmGame(body) {
     };
   }
 
+  // Прогрев уже идёт (например, стартовал при выборе игры). Второй не нужен.
+  const lock = await readJson(warmLockKey(id)).catch(() => null);
+
+  if (lock && lock.at && Date.now() - Number(lock.at) < WARM_LOCK_MS) {
+    return {
+      status: 'busy',
+      gameId: id,
+      game: manifest.game,
+      cached: false,
+      pages: 0,
+      sections: cached && cached.sections || {},
+      message: 'Прогрев этой игры уже выполняется.'
+    };
+  }
+
+  await writeJson(warmLockKey(id), { at: Date.now() });
+
   const language = translationLanguage(manifest);
   const index = await readJson(indexKey(id)) || {
     schemaVersion: 1,
@@ -1970,12 +2025,18 @@ async function warmGame(body) {
     Object.values(sections).reduce((acc, list) => acc.concat(list), [])
   ));
 
-  manifest.pageCount = index.items.length;
-  manifest.updatedAt = new Date().toISOString();
-  manifest.lastWarmAt = manifest.updatedAt;
+  // Слияние с тем, что мог записать параллельный поиск, и снятие замка.
+  const mergedPages = await writeIndexMerged(id, index);
+  const freshManifest = await readJson(manifestKey(id)).catch(() => null) || manifest;
 
-  await writeJson(indexKey(id), index);
-  await writeJson(manifestKey(id), manifest);
+  freshManifest.pageCount = mergedPages;
+  freshManifest.updatedAt = new Date().toISOString();
+  freshManifest.lastWarmAt = freshManifest.updatedAt;
+
+  await writeJson(manifestKey(id), freshManifest);
+  await writeJson(warmLockKey(id), { at: 0, finishedAt: Date.now() });
+
+  manifest = freshManifest;
 
   const warm = {
     schemaVersion: 1,
@@ -2419,7 +2480,7 @@ async function searchGame(body) {
     evaluated.push(...loaded.filter(Boolean));
   }
 
-  if(indexChanged&&!fast)await writeJson(indexKey(id),index);
+  if(indexChanged&&!fast)await writeIndexMerged(id,index);
 
   evaluated.sort((a,b)=>
     b.score-a.score||b.evidenceScore-a.evidenceScore
