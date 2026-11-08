@@ -38,7 +38,7 @@ const MAX_GAME = 60;
 const MAX_BODY = 2 * 1024 * 1024;
 const MARKER_INTERVAL_S = 3;
 const MARKER_FRESH_S = 5;
-const BACKEND_VERSION = '3.1.0';
+const BACKEND_VERSION = '3.2.0';
 const KB_URL = process.env.KB_URL || '';
 const KB_TOKEN = process.env.KB_TOKEN || '';
 const KB_TIMEOUT_MS = 8000;
@@ -1650,6 +1650,23 @@ function isWarmConfigured() {
   return !!(KB_URL && KB_TOKEN && TOKEN && SELF_URL);
 }
 
+// Начало стрима видно раньше первого вопроса: приложение сразу шлёт кадры
+// и опрашивает ?poll=1. Поэтому база греется по этим сигналам, а паузы
+// needsWarm не дают запускать прогрев на каждый кадр и опрос.
+async function maybeWarmFromStream(st, uid) {
+  const game = effectiveGame(st, '', uid || '');
+
+  if (!needsWarm(st, game)) return false;
+
+  markWarmScheduled(st, game);
+
+  if (!(await saveState(st))) return false;
+
+  await kickWarm(game, uid || '', 300);
+
+  return true;
+}
+
 // ?warm=1 — прогреть базу по текущей или названной игре.
 // Ответ возвращается после прогрева, поэтому в реплику Алисы его не ждут:
 // навык вызывает прогрев отдельным запросом с коротким таймаутом.
@@ -1796,6 +1813,11 @@ async function handleFrame(buf) {
 
   if (!res.ok || !res.saved) {
     return { code: 503, body: { status: 'wait' } };
+  }
+
+  // Первый кадр нового стрима прогревает базу по текущей игре.
+  if (res.state) {
+    await maybeWarmFromStream(res.state, '');
   }
 
   console.log('mv frame seq=' + res.seq + ' size=' + buf.length);
@@ -2461,7 +2483,11 @@ function configOut(st) {
   };
 }
 
-function pollOut(st) {
+async function pollOut(st) {
+  // Приложение опрашивает этот роут каждые 1,5 с с момента старта стрима,
+  // поэтому прогрев стартует здесь, не дожидаясь первого вопроса.
+  await maybeWarmFromStream(st, '');
+
   const fa = freshAnswerWithMarker(st);
 
   if (fa) {
@@ -2631,7 +2657,7 @@ async function route(event) {
     }
 
     if (qp.poll === '1') {
-      return pollOut(await getState());
+      return await pollOut(await getState());
     }
 
     if (qp.ready === '1') {

@@ -169,6 +169,17 @@ async function post(body) {
   return { code: res.statusCode, body: JSON.parse(res.body) };
 }
 
+async function postFrame() {
+  const res = await mv.handler({
+    httpMethod: 'POST',
+    headers: { 'content-type': 'image/jpeg' },
+    queryStringParameters: { token: TOKEN },
+    body: Buffer.from([0xFF, 0xD8, 0xFF, 0xE0, 0x00]),
+    isBase64Encoded: false
+  });
+  return { code: res.statusCode, body: JSON.parse(res.body) };
+}
+
 const results = [];
 
 function check(name, ok, detail) {
@@ -422,6 +433,61 @@ async function main() {
   });
 
   check('фон: тёплая база не перегревается',
+    selfCalls.length === 0, selfCalls.join(' | '));
+
+  // --- 15. начало стрима: первый ?poll=1 греет базу до вопросов ---
+  s3.reset();
+  const streamState = blank();
+  streamState.game = GAME;
+  streamState.gameSetAt = Date.now();
+  s3.put('state.json', streamState);
+  selfCalls.length = 0;
+
+  const poll = await call({ poll: '1' });
+
+  check('стрим: опрос отвечает как раньше', poll.body.status === 'ok',
+    JSON.stringify(poll.body).slice(0, 100));
+  check('стрим: прогрев стартовал без вопроса',
+    selfCalls.length === 1 && /warm=1/.test(selfCalls[0]),
+    selfCalls.join(' | '));
+  check('стрим: прогрев записан в состояние',
+    (s3.get('state.json') || {}).warm &&
+    s3.get('state.json').warm.status === 'scheduled',
+    JSON.stringify((s3.get('state.json') || {}).warm));
+
+  selfCalls.length = 0;
+  await call({ poll: '1' });
+  check('стрим: следующий опрос не греет повторно',
+    selfCalls.length === 0, selfCalls.join(' | '));
+
+  // --- 16. первый кадр нового стрима тоже запускает прогрев ---
+  s3.reset();
+  const frameState = blank();
+  frameState.game = GAME;
+  frameState.gameSetAt = Date.now();
+  s3.put('state.json', frameState);
+  selfCalls.length = 0;
+
+  const frame = await postFrame();
+
+  check('кадр: загружен', frame.body.status === 'ok',
+    JSON.stringify(frame.body).slice(0, 100));
+  check('кадр: прогрев стартовал от первого кадра',
+    selfCalls.length === 1 && /warm=1/.test(selfCalls[0]),
+    selfCalls.join(' | '));
+  check('кадр: прогрев записан в состояние',
+    (s3.get('state.json') || {}).warm &&
+    s3.get('state.json').warm.status === 'scheduled',
+    JSON.stringify((s3.get('state.json') || {}).warm));
+
+  // --- 17. игра без свежей привязки стрим не греет ---
+  s3.reset();
+  s3.put('state.json', blank());
+  selfCalls.length = 0;
+
+  await call({ poll: '1' });
+
+  check('стрим: без названной игры прогрева нет',
     selfCalls.length === 0, selfCalls.join(' | '));
 
   const failed = results.filter(r => !r.ok);
