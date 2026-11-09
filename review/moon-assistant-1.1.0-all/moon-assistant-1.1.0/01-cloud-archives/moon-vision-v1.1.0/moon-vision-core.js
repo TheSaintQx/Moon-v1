@@ -76,7 +76,7 @@ const REASONING_EFFORT = String(process.env.MOON_REASONING || '').trim();
 // попытками, чтобы повторные вопросы не запускали прогрев заново.
 const SELF_URL = String(
   process.env.SELF_URL ||
-  'https://functions.yandexcloud.net/d4e1e6pg7nh0cu152kd2'
+  'https://functions.yandexcloud.net/d4el6hpg7nh0cui52kd2'
 ).replace(/\/+$/, '');
 const WARM_OK_TTL_MS = 6 * 3600 * 1000;
 const WARM_RETRY_MS = 30 * 60 * 1000;
