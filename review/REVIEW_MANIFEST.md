@@ -121,7 +121,7 @@ review/
 | 1 | `moon-assistant-1.1.0-all.zip` | 1 116 963 | `3852069c26ebc8344ae1ff13b23ccfe3cecfa49d75d49bdc5fe9a2ec810e6fec` | 47 (39 файлов + 8 каталогов) | `review/moon-assistant-1.1.0-all/` | 0 |
 | 2 | `…/01-cloud-archives/moon-knowledge-engine-v1.1.0.zip` | 34 314 | `031feba951b96d7cae63a94ba543f5e59b451f82148d62d8ba0f415450c0af15` | 2 | `…/01-cloud-archives/moon-knowledge-engine-v1.1.0/` | 1 |
 | 3 | `…/01-cloud-archives/moon-skill-v1.1.0.zip` | 13 710 | `3411c641d18315f1a99fe0fffb7f65f11366f07a202456972fd0815a12f8f17e` | 3 | `…/01-cloud-archives/moon-skill-v1.1.0/` | 1 |
-| 4 | `…/01-cloud-archives/moon-vision-v1.1.0.zip` | 30 945 | `a0fafd9f23c2ec80710bf4b2d369d295419d9c04cc0ab5ad9a8c036dea7391b9` | 3 | `…/01-cloud-archives/moon-vision-v1.1.0/` | 1 |
+| 4 | `…/01-cloud-archives/moon-vision-v1.1.0.zip` | 30 909 | `61e1ee7421d7a2372f6a5d44ab01e3e2f3e84322c8f00b8a492f6b111cce9532` | 3 | `…/01-cloud-archives/moon-vision-v1.1.0/` | 1 |
 
 Полный путь вложенных архивов: `review/moon-assistant-1.1.0-all/moon-assistant-1.1.0/01-cloud-archives/`.
 
@@ -147,7 +147,7 @@ review/
 | --- | --- |
 | `README_СДАЧА.md` | Точка входа для приёмки: что сделано в релизе 1.1.0, какие архивы забирать, порядок загрузки в облако и как проверить результат. |
 | `СОДЕРЖАНИЕ.md` | Оглавление пакета: состав четырёх частей, порядок действий, как забрать исходники, предупреждение о перевыпуске ключей. |
-| `SHA256SUMS-ALL.txt` | Контрольные суммы всех файлов пакета (38 строк). Служит для сверки целостности поставки. |
+| `SHA256SUMS-ALL.txt` | Контрольные суммы всех файлов пакета (45 строк). Служит для сверки целостности поставки. |
 
 ### 3.2. `01-cloud-archives/` — загружаемое в облако
 
@@ -265,9 +265,9 @@ review/
 1. Все три вложенных ZIP-архива побайтово совпадают с исходными (проверено `sha256sum` и
    `zipfile.testzip()` при распаковке — повреждённых записей нет).
 2. `01-cloud-archives/SHA256SUMS.txt` сходится с тремя облачными архивами (проверено).
-3. `SHA256SUMS-ALL.txt` из 38 строк: **36 совпадают**, 1 не сходится —
-   `03-sources/moon-v1-1.1.0.patch` (в нём заменён секрет, раздел 5), 1 не читается —
-   `03-sources/moon-v1-1.1.0.bundle` (исключён из ветки, раздел 6).
+3. `SHA256SUMS-ALL.txt` пересчитан по текущему дереву ветки (45 строк, все совпадают).
+   Исходные суммы поставки остались в `moon-assistant-1.1.0-all.zip` и в истории
+   ветки `review/full-unpacked`; расхождение по патчу — из-за замены секрета (раздел 5).
 4. Остальные файлы, включая все `.js`, `.java`, `.md` и `.sh`, не изменялись; их хеши совпадают
    с `SHA256SUMS-ALL.txt`.
 
@@ -295,3 +295,20 @@ find . -name '*.zip'   # новых вложенных архивов не ос�
 ```
 
 Затем повторить замену секрета из раздела 5 и удалить `03-sources/moon-v1-1.1.0.bundle` (раздел 6).
+
+---
+
+## 10. Ветка исправлений `fix/cloud-functions-1.1.0`
+
+Ветка создана от `review/full-unpacked`. `main` и `review/full-unpacked` не изменялись.
+
+| Что | Было | Стало |
+| --- | --- | --- |
+| `SELF_URL` в `moon-vision` (`03-sources/moon-v1/` и `01-cloud-archives/moon-vision-v1.1.0/`) | `https://functions.yandexcloud.net/d4e1e6pg7nh0cu152kd2` | `https://functions.yandexcloud.net/d4el6hpg7nh0cui52kd2` |
+| `01-cloud-archives/moon-vision-v1.1.0.zip` | 30 945 байт, `a0fafd9f…` | 30 909 байт, `61e1ee7421d7a2372f6a5d44ab01e3e2f3e84322c8f00b8a492f6b111cce9532` |
+| Документы (`ИНСТРУКЦИЯ.md`, `README_RU.md`, `ТЕСТИРОВАНИЕ.md`, `CHANGELOG.md`, `android-patch/README.md`) | старый адрес | новый адрес, порядок сборки APK и секрет `MOON_TOKEN` |
+
+`moon-knowledge-engine-v1.1.0.zip` и `moon-skill-v1.1.0.zip` не пересобирались:
+их код не менялся. Версии функций и файлы `VERSION` не менялись.
+`03-sources/moon-v1-1.1.0.patch` оставлен историческим артефактом релиза — он
+описывает состояние до правки, актуальный код лежит в `03-sources/moon-v1/`.
