@@ -91,7 +91,7 @@ cd dist && sha256sum -c SHA256SUMS.txt
 | `SECRET_ACCESS_KEY` | да | — | секрет статического ключа S3 |
 | `KB_URL` | да | — | адрес `moon-knowledge-engine` |
 | `KB_TOKEN` | да | — | токен базы знаний (совпадает с `KB_TOKEN` движка) |
-| `SELF_URL` | нет | `https://functions.yandexcloud.net/d4e1e6pg7nh0cu152kd2` | собственный адрес: прогрев и запуск разбора |
+| `SELF_URL` | нет | `https://functions.yandexcloud.net/d4el6hpg7nh0cui52kd2` | собственный адрес: прогрев и запуск разбора |
 | `MOON_DEEP` | нет | `1` | `0` выключает второй этап (разбор) |
 | `MOON_REASONING` | нет | — | `low`/`medium`/`high`; если пусто, `reasoning_effort` не отправляется |
 
