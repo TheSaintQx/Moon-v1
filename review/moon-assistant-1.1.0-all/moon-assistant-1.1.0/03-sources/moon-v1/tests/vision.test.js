@@ -845,6 +845,107 @@ async function main() {
   check('резервная копия: создана в этом часу',
     s3.get(hourKey) !== null, hourKey);
 
+  // --- 29. гонка ack: подтверждается именно показанная стадия ---
+  s3.reset();
+
+  const race = blank();
+
+  race.game = GAME;
+  race.gameSetAt = Date.now();
+  race.warm = {
+    game: GAME, status: 'ok', at: Date.now(), startedAt: Date.now(), pages: 6
+  };
+  s3.put('state.json', race);
+
+  kbState.mode = 'hit';
+  modelState.mode = 'ok';
+  selfCalls.length = 0;
+
+  const raceAsk = await post({
+    q: 'когда основан найт сити', game: GAME, cid: 'c-race-1', uid: UID
+  });
+  const raceQid = String(raceAsk.body.qid);
+
+  check('гонка ack: короткий ответ получен',
+    raceAsk.body.stage === 'quick' && raceQid !== '0',
+    JSON.stringify(raceAsk.body).slice(0, 160));
+
+  // Разбор заканчивается раньше, чем оверлей подтвердил короткий ответ.
+  const raceDeep = await call({ deep: '1', qid: raceQid });
+
+  check('гонка ack: разбор готов до подтверждения',
+    raceDeep.body.stage === 'deep' && raceDeep.body.final === true,
+    JSON.stringify(raceDeep.body).slice(0, 160));
+
+  // Запоздавшее подтверждение именно короткого ответа.
+  const lateQuick = await call({ ack: '1', qid: raceQid, stage: 'quick' });
+
+  check('гонка ack: запоздавший quick подтверждает quick, а не deep',
+    lateQuick.body.status === 'ok' && lateQuick.body.stage === 'quick',
+    JSON.stringify(lateQuick.body));
+
+  const raceReady = await call({ ready: '1' });
+
+  check('гонка ack: разбор всё ещё ждёт показа',
+    raceReady.body.ready && raceReady.body.ready.qid === Number(raceQid) &&
+      raceReady.body.ready.stage === 'deep' && raceReady.body.ready.final === true,
+    JSON.stringify(raceReady.body.ready));
+
+  const deepAck = await call({ ack: '1', qid: raceQid, stage: 'deep' });
+
+  check('гонка ack: подтверждение deep помечает deep',
+    deepAck.body.status === 'ok' && deepAck.body.stage === 'deep',
+    JSON.stringify(deepAck.body));
+
+  const raceReadyAfter = await call({ ready: '1' });
+
+  check('гонка ack: после подтверждения разбора показывать нечего',
+    !raceReadyAfter.body.ready || raceReadyAfter.body.ready.qid !== Number(raceQid),
+    JSON.stringify(raceReadyAfter.body.ready));
+
+  // Запоздавшее quick после подтверждённого разбора не откатывает стадию.
+  const staleQuick = await call({ ack: '1', qid: raceQid, stage: 'quick' });
+
+  check('гонка ack: поздний quick не откатывает подтверждённый deep',
+    staleQuick.body.status === 'ok' && staleQuick.body.stage === 'deep',
+    JSON.stringify(staleQuick.body));
+
+  // --- 30. обратная совместимость: ack без stage ---
+  s3.reset();
+
+  const compat = blank();
+
+  compat.game = GAME;
+  compat.gameSetAt = Date.now();
+  compat.answers['777'] = doneRecord({
+    qid: 777,
+    status: 'deep_ready',
+    quick: { text: 'Найт-Сити основан в мае 1994 года.', src: 'kb', unk: false },
+    text: 'Разбор: Найт-Сити основан в мае 1994 года.',
+    ackedAt: 0,
+    ackedStage: ''
+  });
+  s3.put('state.json', compat);
+
+  const compatReady = await call({ ready: '1' });
+
+  check('совместимость: разбор ждёт показа до подтверждения',
+    compatReady.body.ready && compatReady.body.ready.qid === 777 &&
+      compatReady.body.ready.stage === 'deep',
+    JSON.stringify(compatReady.body.ready));
+
+  const compatAck = await call({ ack: '1', qid: '777' });
+
+  check('совместимость: ack без stage подтверждает текущую стадию',
+    compatAck.body.status === 'ok' && compatAck.body.stage === 'deep',
+    JSON.stringify(compatAck.body));
+
+  const compatAfter = await call({ ready: '1' });
+
+  check('совместимость: после старого ack повтора нет',
+    !compatAfter.body.ready || compatAfter.body.ready.qid !== 777,
+    JSON.stringify(compatAfter.body.ready));
+
   const failed = results.filter(r => !r.ok);
 
   console.log('\n' + (results.length - failed.length) + '/' +

@@ -2958,12 +2958,17 @@ function stateOut(st) {
 }
 
 // Оверлей показывает ответ, как только он готов, и подтверждает показ через ack.
-async function handleAck(qidValue) {
+// stage приходит от клиента: он подтверждает ровно ту стадию, которую показал.
+// Без stage (сборки Android до 1.1.1) стадия берётся из текущего состояния задачи.
+async function handleAck(qidValue, stageValue) {
   const id = String(qidValue || '').trim();
 
   if (!/^\d+$/.test(id)) {
     return { code: 400, body: { status: 'bad_request' } };
   }
+
+  const wantStage = String(stageValue || '').trim().toLowerCase();
+  const staged = wantStage === 'quick' || wantStage === 'deep';
 
   const st = await getState();
   const rec = (st.answers || {})[id];
@@ -2972,8 +2977,20 @@ async function handleAck(qidValue) {
     return { code: 200, body: { status: 'none', qid: Number(id) } };
   }
 
+  // Подтверждение разбора уже получено: запоздавшее подтверждение короткого
+  // ответа не должно откатывать стадию назад и заставлять сервер показывать
+  // разбор повторно.
+  if (staged && wantStage === 'quick' && rec.ackedStage === 'deep') {
+    return {
+      code: 200,
+      body: { status: 'ok', qid: Number(id), stage: rec.ackedStage }
+    };
+  }
+
   rec.ackedAt = nowS();
-  rec.ackedStage = stageOf(rec) || 'deep';
+  // Быстрое подтверждение фиксирует именно quick, даже если задача уже ушла
+  // в deep_ready: иначе гонка закрывала бы разбор, который ещё не показывали.
+  rec.ackedStage = staged ? wantStage : (stageOf(rec) || 'deep');
   await saveState(st);
 
   return {
@@ -3360,7 +3377,7 @@ async function route(event) {
     }
 
     if (qp.ack === '1') {
-      return await handleAck(qp.qid);
+      return await handleAck(qp.qid, qp.stage);
     }
 
     if (qp.progress === '1') {
