@@ -125,7 +125,7 @@ review/
 | 1 | `moon-assistant-1.1.0-all.zip` | 1 116 963 | `3852069c26ebc8344ae1ff13b23ccfe3cecfa49d75d49bdc5fe9a2ec810e6fec` | 47 (39 файлов + 8 каталогов) | `review/moon-assistant-1.1.0-all/` | 0 |
 | 2 | `…/01-cloud-archives/moon-knowledge-engine-v1.1.0.zip` | 34 314 | `031feba951b96d7cae63a94ba543f5e59b451f82148d62d8ba0f415450c0af15` | 2 | `…/01-cloud-archives/moon-knowledge-engine-v1.1.0/` | 1 |
 | 3 | `…/01-cloud-archives/moon-skill-v1.1.0.zip` | 13 710 | `3411c641d18315f1a99fe0fffb7f65f11366f07a202456972fd0815a12f8f17e` | 3 | `…/01-cloud-archives/moon-skill-v1.1.0/` | 1 |
-| 4 | `…/01-cloud-archives/moon-vision-v1.1.0.zip` | 30 909 | `61e1ee7421d7a2372f6a5d44ab01e3e2f3e84322c8f00b8a492f6b111cce9532` | 3 | `…/01-cloud-archives/moon-vision-v1.1.0/` | 1 |
+| 4 | `…/01-cloud-archives/moon-vision-v1.1.0.zip` | 31 247 | `08983f97f722a766ee35065325983243f67827a6ee0386298e5b6733f6d5bcc5` | 3 | `…/01-cloud-archives/moon-vision-v1.1.0/` | 1 |
 
 Полный путь вложенных архивов: `review/moon-assistant-1.1.0-all/moon-assistant-1.1.0/01-cloud-archives/`.
 `moon-vision-v1.1.0.zip` — единственный архив, который в ветке исправлений пересобран
@@ -318,15 +318,17 @@ find . -name '*.zip'   # новых вложенных архивов не ос�
 | Что | Было | Стало |
 | --- | --- | --- |
 | `SELF_URL` в `moon-vision` (`03-sources/moon-v1/` и `01-cloud-archives/moon-vision-v1.1.0/`) | `https://functions.yandexcloud.net/d4e1e6pg7nh0cu152kd2` | `https://functions.yandexcloud.net/d4el6hpg7nh0cui52kd2` |
-| `01-cloud-archives/moon-vision-v1.1.0.zip` | 30 945 байт, `a0fafd9f…` | 30 909 байт, `61e1ee7421d7a2372f6a5d44ab01e3e2f3e84322c8f00b8a492f6b111cce9532` |
+| `01-cloud-archives/moon-vision-v1.1.0.zip` | 30 945 байт, `a0fafd9f…` | 31 247 байт, `08983f97f722a766ee35065325983243f67827a6ee0386298e5b6733f6d5bcc5` |
 | Документы (`ИНСТРУКЦИЯ.md`, `README_RU.md`, `ТЕСТИРОВАНИЕ.md`, `CHANGELOG.md`, `android-patch/README.md`) | старый адрес | новый адрес, порядок сборки APK и секрет `MOON_TOKEN` |
+| `?ack=1` в `moon-vision` и `android-patch/FrameCapture.java` | стадия определялась только сервером | клиент передаёт `stage=quick\|deep`, сервер записывает именно её; без `stage` — прежняя логика |
 
 `moon-knowledge-engine-v1.1.0.zip` и `moon-skill-v1.1.0.zip` не пересобирались:
 их код не менялся. Версии функций и файлы `VERSION` не менялись.
 
 Проверки в этой ветке (Node.js 22.14.0, каталог `03-sources/moon-v1`):
-`kb.test.js` — 66/66, `vision.test.js` — 83/83, `skill.test.js` — 27/27,
-`adapter.test.js` — 14/14, `node --check` для обоих `moon-vision-core.js` — без ошибок.
+`kb.test.js` — 66/66, `vision.test.js` — 93/93 (включая регрессию гонки `ack`
+и обратную совместимость без `stage`), `skill.test.js` — 27/27,
+`adapter.test.js` — 14/14, `node --check` для ядра и тестов — без ошибок.
 Контрольные суммы: `SHA256SUMS-ALL.txt` — 45/45, `01-cloud-archives/SHA256SUMS.txt` — 3/3.
 Живые вызовы функций в Yandex Cloud и сборка APK не выполнялись.
 `03-sources/moon-v1-1.1.0.patch` оставлен историческим артефактом релиза — он
