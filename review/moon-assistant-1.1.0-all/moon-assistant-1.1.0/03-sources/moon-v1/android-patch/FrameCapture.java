@@ -584,21 +584,37 @@ public class FrameCapture {
     }
 
     // Подтверждение показа: сервер перестаёт повторять это уведомление.
+    // Стадия передаётся явно: подтверждение короткого ответа не должно закрывать
+    // разбор, который сервер уже успел подготовить к этому моменту.
     // Если сеть подвела, уведомление придёт снова и оверлей просто обновится.
     private void sendAck(final int qid, final String stage) {
+        final String ackStage = "quick".equals(stage) ? "quick"
+                : ("deep".equals(stage) ? "deep" : "");
+
+        if (qid <= 0 || ackStage.isEmpty()) {
+            Log.w(TAG, "DIAG: ack skipped qid=" + qid + " stage=" + stage);
+            return;
+        }
+
         if (netHandler == null) return;
+
+        // Без токена запрос не отправляем и в лог пишем только причину.
+        if (token().isEmpty()) {
+            Log.w(TAG, "DIAG: ack skipped: MOON_TOKEN не задан");
+            return;
+        }
 
         netHandler.post(new Runnable() {
             @Override public void run() {
                 try {
                     String url = CLOUD_ENDPOINT + "?token=" + token()
-                            + "&ack=1&qid=" + qid;
+                            + "&ack=1&qid=" + qid + "&stage=" + ackStage;
                     String[] r = httpCall("GET", url, null, (int) NETWORK_TIMEOUT_MS);
 
                     if ("200".equals(r[0])) {
                         lastAckedQid = qid;
-                        lastAckedStage = stage;
-                        Log.i(TAG, "DIAG: ack ok qid=" + qid + " stage=" + stage);
+                        lastAckedStage = ackStage;
+                        Log.i(TAG, "DIAG: ack ok qid=" + qid + " stage=" + ackStage);
                     } else {
                         Log.w(TAG, "ack failed qid=" + qid + " status=" + r[0]);
                     }
